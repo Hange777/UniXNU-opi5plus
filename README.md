@@ -4,16 +4,24 @@
 (Orange Pi 5 Plus, Rockchip RK3588, 8 GiB). It targets the iPadOS 17.7.11 (21H461) userland on a source-built
 XNU, started from an [edk2-rk3588](https://github.com/edk2-porting/edk2-rk3588) based firmware.
 
-**Status: the userland reaches its home screen; input works by scripted injection.** Milestones M0 to M5 are done:
+**Status: the userland reaches its home screen; input works by scripted injection and, since
+round 14, by real USB keyboard/mouse through the OHCI mailbox.** Milestones M0 to M5 are done:
 the iPadOS 17.7.11 userland boots from this repository's payload to `Early boot complete. Continuing system boot.`,
 250+ processes run, `SpringBoard` stays alive, and at 2560x1440 the compositor's frames reach the panel through the
 firmware's GOP frame buffer. Round 3 (2026-11-12) closed the input half of M6: the payload's `opi5-hid-input=2`
 publishes the digitizer collection on an `IOHIDEventService`, `IOHIDEventDriver` opens it, and 4,830 injected
 reports were accepted with 0 failures — which drove SpringBoard **from the lock screen into the home screen**, a
-transition round 2 never made in 63 minutes (`porting.toml` marks `input` `device-verified`). What is still missing
-is real hardware input: no USB device enumerates, because XNU has no USB host stack here (`IOUSBHostFamily` /
-`AppleUSBXHCI` are not in the prelink), and a hot-plugged wireless mouse therefore does nothing. Two names earlier
-rounds cited as evidence do not hold: `IOHIDSystem` is not a class of this kernel at all (`evidence/m5/M5-08`), and
+transition round 2 never made in 63 minutes (`porting.toml` marks `input` `device-verified`). Round 14
+(2026-11-13) then closed the real-input half: the polled-OHCI driver (`package/Opi5plusUsb`, staged
+as tier 3 = enumeration, tier 5 = poll + mailbox, parser `NativeUsb.cpp:821`) enumerated the Razer
+Viper V2 Pro receiver on ohci1 in tier 3 and, in tier 5, delivered real keyboard/mouse reports to
+`handleReport` — 6,154 handed with 0 errors while the synthetic injector coexisted; the device goes
+in a USB 2.0 Type-A port because a hub or an xHCI port is refused (`NativeUsb.cpp:691`)
+([`evidence/round14-result.md`](evidence/round14-result.md)). What is still missing after round 14
+is hot-plug measurement, and interaction exposed a new problem: an application-launch layer defect
+(all opened apps instantly quit with `exit xpcproxy ... code 78`, then the UI render threads wedge
+at the same user PCs and the screen freezes with the compositor no longer committing frames). Earlier
+rounds' two names cited as USB evidence do not hold: `IOHIDSystem` is not a class of this kernel at all (`evidence/m5/M5-08`), and
 the `XHCI: Initialize DWC3` / `XhcDriverBindingStart` lines are the firmware's own `XhciDxe.efi` printing before
 `DARWINBOOT: hand-off`, so they prove the firmware has USB, not that XNU does. At that point the picture still
 carried horizontal banding inside the large glyphs, and the userland never arms a vsync (`sent=0` in every round
@@ -57,7 +65,13 @@ are all 2560x1440 ARGB with no plain-white layer among them — the lock-screen 
 grid points black + 1 white (~1/25 of the panel, the white block's area) and the desktop reads mixed —
 so the white content sits **inside the composited frame** (a widget-placeholder layer whose content is
 blank; the App Store icon renders on top of the block), with parity at 175 swaps / 0 copies / latch
-mean 11.8 ms ([`evidence/round13-result.md`](evidence/round13-result.md)).
+mean 11.8 ms ([`evidence/round13-result.md`](evidence/round13-result.md)). Round 14 (2026-11-13)
+brought the S1/S2 USB code to the board in two tiers and closed the input line's real-device half:
+tier 3 verified enumeration (1532:00a6 on ohci1, boot mouse + boot keyboard interfaces, report
+protocol parsed), tier 5 verified the mailbox — real reports into `handleReport` with `errors=0`
+throughout, the injector coexisting, parity at 2,596 swaps / 0 copies / latch mean 11.6 ms — and
+the interaction windows exposed the application-launch layer problem (exit 78 storm + UI-thread
+wedge, [`evidence/round14-result.md`](evidence/round14-result.md)).
 `porting.toml`
 marks firmware, cpu and memory `implemented`, and storage, display and input `device-verified`; round 3's measurement is
 [`evidence/round3-result.md`](evidence/round3-result.md), round 2's baseline and root cause is
@@ -83,7 +97,7 @@ This is the whole point of the repository; the UniXNU machinery is identical.
 | RAM | 4 GiB in one bank above 4 GiB | **8 GiB in three banks**: `0x0020_0000` (3.83 GiB), `0x1_0000_0000` (4 GiB), `0x2_f000_0000` (256 MiB), read from the board's own device tree. The ADT takes *one contiguous* range, so this port declares the 4 GiB one above 4 GiB and `dram_size = "0x100000000"`; the kernel's owned window is 2 GiB inside the firmware's low bank, which is why the display memory region is placed at `0x1_0000_0000`. |
 | Storage | eMMC `mmc@fe2e0000` (`rockchip,rk3588-dwcmshc`), `Rk3588Emmc` driver | **No eMMC, no NVMe.** The only block device is a 30 GB SD card behind `mmc@fe2c0000` (DesignWare MSHC in SD mode). This port ships its own `NativeSd` driver in `package/`: it publishes the OS and SystemOS windows read-only at about 11 MiB/s — measured to be the card's own ceiling (a ~26 MHz CRU clock, 89% PIO efficiency; doubling needs clock-tree work, `evidence/sd-clock-investigation.md`) — and serves the 64 MiB Data seed, which is the writable `/private/var`. |
 | Display | DSI panel + VOP2 scan-out (`evb10-vop*`, `Evb10Display`) | **HDMI0 only** (`hdmi@fde80000`), no DSI, no panel. The path is the firmware's GOP frame buffer with the *original* `IOMobileFramebufferLegacy` bound to a forked `GopFramebuffer`, plus `Rk3588VopDirect` for scan-out at 2560x1440. Two kernel passes: `opi5plus_defconfig` and `opi5plus_display_defconfig` (`CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y`). |
-| Input | DSI touch panel (`Evb10Touch`, `evb10-touch*`) | **No touch panel.** M6 starts with scripted HID injection, then USB HID over xHCI. The injection half is verified on the board (round 3 drives SpringBoard to its home screen); the USB half waits on the host stack in the prelink. |
+| Input | DSI touch panel (`Evb10Touch`, `evb10-touch*`) | **No touch panel.** M6 started with scripted HID injection (verified, round 3) and round 14 added real USB HID over the polled-OHCI mailbox (verified: real keyboard/mouse reports reach `handleReport`, `evidence/round14-result.md`); hot-plug and touch are unmeasured. |
 | Console | UART2 `serial@feb50000`, 1.5 Mbaud | Same node, same rate. |
 | GPU | Mali-G610 MP4 | Same GPU, same driver (M7). |
 | Kernel configs | two passes (`evb10_defconfig`, `evb10_display_defconfig`) | the same two passes, for the same reason: the display archive is built against the first-pass kernel and force-loaded into the second. |

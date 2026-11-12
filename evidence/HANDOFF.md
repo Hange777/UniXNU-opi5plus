@@ -1,4 +1,4 @@
-# Handoff - Orange Pi 5 Plus, UniXNU, 2026-11-12 (after round 13)
+# Handoff - Orange Pi 5 Plus, UniXNU, 2026-11-13 (after round 14)
 
 Read `evidence/sd-clock-investigation.md` (rounds 7-10, the SD line's conclusion), then `evidence/round4-6-result.md`
 (rounds 4-6: block-exec, the SD counters, the serial reset key), then `evidence/round3-result.md` for the input
@@ -66,6 +66,23 @@ composition pipeline:
   injector fails 0; the capture ran its full 2,700 s and **the board stayed in XNU (no 0x1d; quota
   1/2)**.
 
+Round 14 (2026-11-13) then closed the USB input line with the S1/S2 code (committed at `800f9e5`)
+brought up in two tiers on the board:
+
+* **Real keyboard and mouse reports reach `handleReport` through the OHCI mailbox.** Tier 3
+  (`opi5-usb=3`) verified enumeration alone: the Razer Viper V2 Pro receiver (1532:00a6) enumerates
+  on ohci1 (boot mouse iface0 + boot kbd iface1 + vendor iface2, report protocol `id -1, 8 bytes,
+  buttons@0/3 x@32/16 y@48/16 wheel@24/8`), VBUS_EN driven high, two disjoint bounce pools. Tier 5
+  (`opi5-usb=5`) verified the mailbox end to end: `HID polling started (keyboard 1, mouse 1)` at
+  boot, `errors=0` in all 193 poll lines, 4 operator interaction sessions pushing 24 non-zero
+  windows (largest 3,701 reports in one window), terminal counters `hid_total=32161 kbd_seq=8
+  mouse_seq=32153 wheel=4`, and the consumer's final **6,154 reports handed to `handleReport`, last
+  result 0x0, with motion 6,067** — while the synthetic injector coexisted (7,981 reports, fails 0).
+  `hid_total` ≫ handed is the designed 8 ms aggregation tick (`NativeHidInput.cpp:529-536`). Parity
+  with round 13: 2,596 swaps / 0 copies / latch mean 11,600 us / 0 over 50 ms / procs 224 / panic 0
+  (`evidence/round14-result.md`). **A new problem was exposed by the interaction** and is item 5
+  below.
+
 ## The infrastructure this session added
 
 * **Round-end automation: the board resets itself back to Linux.** `py -3 tools/wsl/serial-reset.py` sends 0x1d
@@ -93,7 +110,7 @@ composition pipeline:
 
 ## What is still broken, and the next step for each
 
-1. **Input - injected reports work, a real pointer does not.** Round 3 settled the injection half: the digitizer
+1. **Input - injected reports work, and since round 14 real USB keyboard/mouse reports reach the consumer too** (round 14 closed the "no USB device enumerates" half: the polled-OHCI mailbox feeds `handleReport`, `evidence/round14-result.md`). Round 3 settled the injection half: the digitizer
    collection is published on the event service, `IOHIDEventDriver` opens it, 4,830 reports were accepted with 0
    fails and `vsync`-free, and SpringBoard unlocked itself into the home screen (`evidence/round3-result.md`). What
    no round has done is attach a **USB** device: a wireless mouse hot-plugged during round 3 changed nothing, which
@@ -170,6 +187,20 @@ composition pipeline:
    `vext/vpur/vinact/vact/vcact/vcmode/lsr` (patch 0002's beat thread, `:1553-1625`, and the counter
    functions in `osfmk/kern/debug.c`, `:1920-1930`) to build the jetsam/compressor baseline, then optionally
    run a `vm_compressor=2` comparison boot.
+5. **Application launch layer - exposed by round 14's real input, the first problem the interaction
+   windows surfaced.** With the mouse working (mode5's full chain), the user's app-launch attempts
+   all opened and instantly quit, then the screen froze; unplugging USB changed nothing. The
+   passive serial probe (`logs/probe-frozen.py`, read-only 15 s) proves the kernel and userland
+   were alive (beats 2720/2725/2730 healthy, launchd spawn/exit continuing) while **the compositor
+   stopped committing frames (swap frozen at 2,596)** and **backboardd/WidgetRenderer_D threads
+   were repeatedly sampled parked at the same two user PCs (0x1daf40b58 / 0x1daf46bdc)**; two
+   suspect clues coexist: a `exit xpcproxy[...] rv 0x4e00 sig 0 code 78` storm (≈ EX_CONFIG; 163
+   lines, pids 81-599) and backboardd's `mali ... refuses a DRM_FORMAT_MOD_LINEAR image for host
+   allocations` (14 lines, msgs 34-62) on the app-texture path. Not a kernel death, not a watchdog
+   scenario; a UI/render-thread wedge plus an app-spawn failure, in the same family as the white
+   blocks (WidgetRenderer threads in the wedge queues). **Next step: symbolise the wedge PCs
+   against the dyld shared cache (`dsc.py --slide`) and attribute the exit-78 storm**
+   (`evidence/round14-result.md` S4).
 
 ## Key commands
 

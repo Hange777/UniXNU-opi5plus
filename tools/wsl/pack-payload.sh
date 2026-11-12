@@ -2,7 +2,7 @@
 # pack-payload.sh -- the regular payload pack for this board (replaces the per-round
 # tmp-payload-rN.sh copies: same skeleton, no per-round argument list).
 #
-# The boot arguments live in board.toml, [payload] kernel_args (52 arguments, 961 bytes of the
+# The boot arguments live in board.toml, [payload] kernel_args (53 arguments, 972 bytes of the
 # 1000-byte limit). This script passes NO --kernel-arg on purpose: board.toml is the single argument
 # source, so a plain rebuild cannot lose the display, SD or HID groups the round scripts used to
 # carry. The merge rule is scripts/unixnu/payload.py:93-96 -- a board entry whose name a --kernel-arg
