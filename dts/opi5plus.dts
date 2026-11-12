@@ -1,0 +1,89 @@
+// SPDX-License-Identifier: BSD-2-Clause-Patent
+/dts-v1/;
+/include/ "rk3588.dtsi"
+
+/ {
+	model = "Orange Pi 5 Plus";
+	compatible = "xunlong,orangepi-5-plus", "rockchip,rk3588";
+
+	// The board runs 8 GiB, but not as one range. board/current-opi5plus.dts (the board's own device tree,
+	// decompiled) describes three real banks:
+	//
+	//   memory { reg = <0x0 0x00200000 0x0 0xefe00000      // 0x0020_0000, 0xefe0_0000 bytes
+	//                  0x1 0x00000000 0x1 0x00000000      // 0x1_0000_0000, 0x1_0000_0000 bytes
+	//                  0x2 0xf0000000 0x0 0x10000000      // 0x2_f000_0000, 0x1000_0000 bytes
+	//                  0x0 0x0 0x0 0x0 ... >; };          // the vendor tree pads the property with zeros
+	//
+	// 0xefe0_0000 + 0x1_0000_0000 + 0x1000_0000 = 0x1_ffe0_0000, i.e. 8 GiB less the 2 MiB the firmware
+	// keeps at the bottom. The low bank ends at 0xf000_0000 and the next one starts at 0x1_0000_0000, so the
+	// three ranges are separate: nothing between 0x0f00_0000 and 0x1_0000_0000, and 0x1_f000_0000 to
+	// 0x2_f000_0000 is memory the vendor tree does not describe at all.
+	//
+	// The ADT handoff takes ONE contiguous range ("ADT handoff requires one contiguous DRAM range",
+	// scripts/unixnu/devicetree.py), and [payload] dram_size must equal it exactly. This port declares the
+	// high 4 GiB bank, for the same reason UniXNU-evb10 declares its own: it is the one large range without
+	// TF-A, OP-TEE, the firmware volume or Rockchip carve-outs, and it lies entirely above 4 GiB, so it is
+	// also the range whose contents a 32-bit DMA engine can never reach by accident. 4 GiB is the largest
+	// single bank the board has; the low bank alone is 0xefe0_0000 (3.83 GiB).
+	//
+	// Consequences recorded in porting.toml (area `memory`): the kernel starts with 2 GiB of this range
+	// ([payload.adt] owned_memory_size = 0x80000000, below 4 GiB in the firmware's view of the low bank) and
+	// the remaining RAM of the board is not described to XNU. Whether a larger window can be claimed is an
+	// M3 question for the UEFI memory map, not a device-tree question.
+	memory@100000000 {
+		device_type = "memory";
+		reg = <1 0x00000000 1 0x00000000>;
+	};
+};
+
+// Console: UART2 at 1.5 Mbaud, left configured by the firmware. Same node and rate as the EVB10, so the
+// console arguments of board.toml [payload] kernel_args and the SoC's 16550 patch carry over unchanged.
+&uart2 { status = "okay"; };
+
+// The eMMC controller stays disabled: no eMMC module is fitted on this board (docs/hardware.md, and the
+// board's own device tree has no card behind it). The node is left visible so that the day the module
+// arrives the only change here is `status = "okay"` plus the Rk3588Emmc archive (plan.md M4, Plan A).
+&emmc { status = "disabled"; };
+
+// Hardware this port does not drive yet, described so that the addresses are in one place and no node is
+// mistaken for something the firmware hands over. Only `sd` below carries `unixnu,adt-name`, so it is the
+// only one of these that reaches the Apple device tree (scripts/unixnu/devicetree.py exports only nodes
+// with that property and status = "okay").
+&{/soc} {
+	// SD card, the board's only block device (30 GB, GPT, /dev/mmcblk1 on Linux). DesignWare MSHC in SD
+	// mode, a different controller from the eMMC one above: Linux binds it with dw_mmc, and package/NativeSd
+	// drives it for XNU (plan.md M4, Plan B1). Physical base 0xfe2c0000, 16 KiB of registers, SPI 203.
+	//
+	// The firmware's own DwMmcHcDxe + RkSdmmcDxe have already identified the card when XNU starts, so this
+	// node is handed over `okay` on purpose: the ADT exports it as /arm-io/sdmmc, NativeSd matches
+	// "rockchip,rk3588-dw-mshc" there, and it never re-runs identification (SdHost.h's Host::identify only
+	// probes for a card already in the transfer state).
+	//
+	// The `reg` size is the real one: the board's own device tree says 0x4000 (16 KiB), which is what the
+	// firmware's DW_MMC_SIZE uses too. An earlier draft of this file said 0x400000, from a bus-range guess
+	// rather than from the board.
+	sd: mmc@fe2c0000 {
+		compatible = "rockchip,rk3588-dw-mshc", "rockchip,rk3288-dw-mshc";
+		unixnu,adt-name = "sdmmc";
+		reg = <0 0xfe2c0000 0 0x4000>;
+		// No `interrupts`: see the note at the top of rk3588.dtsi. NativeSd polls, and the driver uses
+		// SPI 203 only if it ever needs the line.
+		status = "okay";
+	};
+
+	// Display: VOP2 and HDMI0. The display path of this port is the firmware's GOP frame buffer
+	// (GopFramebuffer), not a scan-out driver, so both stay disabled; they are here because M5's fallback is
+	// a VOP2 direct scan-out like the EVB10's, and because HDMI0 is the only display output the board has
+	// (no DSI panel, no touch screen).
+	vop: vop@fdd90000 {
+		compatible = "rockchip,rk3588-vop";
+		reg = <0 0xfdd90000 0 0x4200>, <0 0xfdd95000 0 0x1000>;
+		status = "disabled";
+	};
+
+	hdmi0: hdmi@fde80000 {
+		compatible = "rockchip,rk3588-dw-hdmi";
+		reg = <0 0xfde80000 0 0x10000>, <0 0xfde90000 0 0x10000>;
+		status = "disabled";
+	};
+};

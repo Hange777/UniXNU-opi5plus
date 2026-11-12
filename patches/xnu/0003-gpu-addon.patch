@@ -1,0 +1,541 @@
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -10152,6 +10152,14 @@
+ 			vnode_put(data_root);
+ 		}
+ 	}
++	{
++		/* The GPU add-on, and the CoreAnimation properties that keep the render server on 8-bit BGRA.
++		 * This runs after the seed above, not before: opi5plus_seed_copy_file() opens its target with
++		 * O_CREAT|O_TRUNC, so the stock .GlobalPreferences.plist out of the OS volume would land on top of
++		 * the one written here and the render server would go back to the deep framebuffer (boot-stub-4). */
++		extern int opi5plus_gpu_addon(proc_t, user_addr_t);
++		(void)opi5plus_gpu_addon(p, scratch);
++	}
+ 	/*
+ 	 * Arm the RK3588 watchdog last, once the mounts are in: from here on the heartbeat thread kicks it every
+ 	 * five seconds, so a kernel that stops running is a reset instead of a board that has to be unplugged.
+@@ -10393,6 +10401,523 @@
+ 	opi5plus_pe_puts("\r\n");
+ 	return 0;
+ }
++/*
++ * The GPU add-on of the Mali (boot argument sd-gpu-addon, on by default when the payload carries one).
++ *
++ * The Metal plug-in bundle -- NativeMaliMetal.bundle with PanVK's libvulkan_panfrost.dylib beside it --
++ * travels in the payload at /chosen/memory-map/GpuAddon in the NGPUADD2 format that
++ * scripts/make-gpu-addon.py and MaliMetal's metal-plugin/make-addon.py write, and that
++ * package/Mali/mali_gpu_addon() reads back. Its files are written under /private/var/ngpu/addons and that
++ * directory is then union-mounted (bindfs, read-only) over /System/Library/Extensions, which is where the
++ * original Metal discovery looks for <plugin>.bundle. The sealed system volume is not touched, and the
++ * files report root as owner (BINDM_FORCE_ROOT of the boot-time mount). Code inside the bundle still has
++ * to pass AMFI through the trust cache; MaliMetal's build-plugin.sh prints the two cdhashes it needs.
++ *
++ * The same hook writes the CoreAnimation properties that keep the render server on 8-bit BGRA: backboardd
++ * otherwise picks a 30-bit deep framebuffer and compressed surfaces, which this board's scanout path takes
++ * as "swap rejected, surface <w>x<h> format 62336138 planes 2" (measured on the EVB10 before its prefs
++ * existed). They are read when the process starts, before any plug-in code can run.
++ */
++#include <libkern/zlib.h>
++
++#define OPI5PLUS_NGPU_DIR "/private/var/ngpu"
++#define OPI5PLUS_ADDON_SOURCE OPI5PLUS_NGPU_DIR "/addons"
++#define OPI5PLUS_ADDON_POINT "/System/Library/Extensions"
++#define OPI5PLUS_ADDON_BUNDLE OPI5PLUS_ADDON_POINT "/NativeMaliMetal.bundle"
++#define OPI5PLUS_PL_HEAD "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" \
++	"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" \
++	"<plist version=\"1.0\">\n<dict>\n"
++#define OPI5PLUS_PL_TAIL "</dict>\n</plist>\n"
++#define OPI5PLUS_PL_FALSE(k) "\t<key>" k "</key>\n\t<false/>\n"
++
++extern int mali_gpu_addon(const uint8_t **data, uint64_t *bytes);
++extern volatile int native_bindfs_boot_mount;
++
++static volatile int opi5plus_addon_files = -1;
++static volatile int opi5plus_addon_written;
++static volatile int opi5plus_addon_same;
++static volatile int opi5plus_addon_failed;
++static volatile int opi5plus_addon_stage;
++static volatile int opi5plus_addon_status = -1;
++
++/* The kernel's zlib is built without default allocators (NO_ZCFUNCS): a stream that has none calls a null
++ * pointer. These two keep the size in front of the block, so the free side needs nothing but the pointer. */
++static void *
++opi5plus_zalloc(void *opaque, unsigned items, unsigned size)
++{
++	size_t n = (size_t)items * size + 16;
++	uint64_t *p = kalloc_data(n, Z_WAITOK | Z_ZERO);
++
++	(void)opaque;
++	if (p == NULL) {
++		return NULL;
++	}
++	p[0] = n;
++	return p + 2;
++}
++
++static void
++opi5plus_zfree(void *opaque, void *ptr)
++{
++	(void)opaque;
++	if (ptr != NULL) {
++		uint64_t *p = (uint64_t *)ptr - 2;
++
++		kfree_data(p, (vm_size_t)p[0]);
++	}
++}
++
++/* A whole zlib stream into dest, which has to come out exactly dest_len bytes. 0 = ok, else zlib's code. */
++static int
++opi5plus_inflate(unsigned char *dest, size_t dest_len, const unsigned char *source, size_t source_len)
++{
++	z_stream zs;
++	int err;
++
++	bzero(&zs, sizeof(zs));
++	zs.next_in = (Bytef *)(uintptr_t)source;
++	zs.avail_in = (uInt)source_len;
++	zs.next_out = dest;
++	zs.avail_out = (uInt)dest_len;
++	zs.zalloc = opi5plus_zalloc;
++	zs.zfree = opi5plus_zfree;
++	err = inflateInit(&zs);
++	if (err != Z_OK) {
++		return err;
++	}
++	err = inflate(&zs, Z_FINISH);
++	if (err != Z_STREAM_END || zs.total_out != dest_len) {
++		(void)inflateEnd(&zs);
++		return err == Z_STREAM_END ? Z_DATA_ERROR : err;
++	}
++	return inflateEnd(&zs);
++}
++
++static int
++opi5plus_set_attrs(vnode_t vp, vfs_context_t ctx, mode_t mode, uid_t uid, gid_t gid)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_mode, mode);
++	VATTR_SET(&va, va_uid, uid);
++	VATTR_SET(&va, va_gid, gid);
++	return vnode_setattr(vp, &va, ctx);
++}
++
++/* One directory, through mkdir(2) from process 1 with the arguments in its scratch page (the mount
++ * arguments sit below 0x400, so the path goes at 0x600). EEXIST is success. */
++static int
++opi5plus_ensure_dir(proc_t p, user_addr_t scratch, vfs_context_t ctx, const char *path, mode_t mode, uid_t uid, gid_t gid)
++{
++	struct mkdir_args request = {.path = scratch + 0x600, .mode = mode};
++	vnode_t vp = NULLVP;
++	int32_t result = 0;
++	int error;
++
++	if (!vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx)) {
++		vnode_put(vp);
++		return 0;
++	}
++	error = copyout(path, request.path, strlen(path) + 1);
++	if (!error) {
++		error = mkdir(p, &request, &result);
++	}
++	if (error && error != EEXIST) {
++		return error;
++	}
++	if (!vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx)) {
++		error = opi5plus_set_attrs(vp, ctx, mode, uid, gid);
++		vnode_put(vp);
++	}
++	return error;
++}
++
++/* Exactly these bytes (O_TRUNC), in pieces of at most 1 MiB, with this owner and mode, on the volume
++ * before it returns. */
++static int
++opi5plus_write_bytes(proc_t p, user_addr_t scratch, vfs_context_t ctx, const char *path, const void *data, size_t size, mode_t mode, uid_t uid,
++    gid_t gid)
++{
++	vnode_t vp = NULLVP;
++	int error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, mode, 0, &vp, ctx);
++	int close_error;
++
++	(void)p;
++	(void)scratch;
++	if (error) {
++		return error;
++	}
++	for (size_t done = 0; !error && done < size;) {
++		size_t piece = MIN(size - done, (size_t)(1024 * 1024));
++		int resid = 0;
++
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)((uintptr_t)data + done), (int)piece, (off_t)done, UIO_SYSSPACE, IO_NOAUTH | IO_UNIT,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (!error && resid) {
++			error = EIO;
++		}
++		done += piece;
++	}
++	if (!error) {
++		error = opi5plus_set_attrs(vp, ctx, mode, uid, gid);
++	}
++	if (!error) {
++		error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++	}
++	close_error = vnode_close(vp, FWRITE, ctx);
++	return error ? error : close_error;
++}
++
++/* Whether the file already holds these bytes with this mode: a second boot of the same payload then
++ * writes nothing. */
++static int
++opi5plus_file_equal(vfs_context_t ctx, const char *path, const uint8_t *data, uint64_t size, uint32_t mode)
++{
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	int equal = 0;
++
++	if (vnode_open(path, FREAD | O_NOFOLLOW, 0, 0, &vp, ctx)) {
++		return 0;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	VATTR_WANTED(&va, va_mode);
++	if (!vnode_getattr(vp, &va, ctx) && va.va_data_size == size && (va.va_mode & 07777) == mode) {
++		const uint32_t chunk = 1024 * 1024;
++		uint8_t *buffer = kalloc_data(chunk, Z_WAITOK);
++
++		if (buffer) {
++			equal = 1;
++			for (uint64_t at = 0; equal && at < size; at += chunk) {
++				int length = (int)(size - at < chunk ? size - at : chunk), resid = 0;
++
++				if (vn_rdwr(UIO_READ, vp, (caddr_t)buffer, length, (off_t)at, UIO_SYSSPACE, IO_NOAUTH, vfs_context_ucred(ctx), &resid,
++				    vfs_context_proc(ctx)) || resid || memcmp(buffer, data + at, length)) {
++					equal = 0;
++				}
++			}
++			kfree_data(buffer, chunk);
++		}
++	}
++	vnode_close(vp, FREAD, ctx);
++	return equal;
++}
++
++static int
++opi5plus_file_has_text(vfs_context_t ctx, const char *path, const char *needle)
++{
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	int found = 0;
++
++	if (vnode_open(path, FREAD | O_NOFOLLOW, 0, 0, &vp, ctx)) {
++		return 0;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	if (!vnode_getattr(vp, &va, ctx) && va.va_data_size > 0) {
++		size_t length = (size_t)MIN(va.va_data_size, (uint64_t)65536), needle_length = strlen(needle);
++		uint8_t *buffer = kalloc_data(length, Z_WAITOK);
++		int resid = 0;
++
++		if (buffer) {
++			if (!vn_rdwr(UIO_READ, vp, (caddr_t)buffer, (int)length, 0, UIO_SYSSPACE, IO_NOAUTH, vfs_context_ucred(ctx), &resid,
++			    vfs_context_proc(ctx))) {
++				for (size_t at = 0; at + needle_length <= length - (size_t)resid && !found; ++at) {
++					found = !memcmp(buffer + at, needle, needle_length);
++				}
++			}
++			kfree_data(buffer, length);
++		}
++	}
++	vnode_close(vp, FREAD, ctx);
++	return found;
++}
++
++/* The add-on's files under /private/var/ngpu. 0: all in place (written or already there). */
++static int
++opi5plus_addon_install(proc_t p, user_addr_t scratch, vfs_context_t ctx)
++{
++	const uint8_t *addon = NULL;
++	uint64_t bytes = 0, total = 0;
++	uint32_t count = 0;
++	int error;
++
++	if (!mali_gpu_addon(&addon, &bytes)) {
++		printf("opi5plus: addon: the loader handed over none (/chosen/memory-map/GpuAddon)\n");
++		return ENOENT;
++	}
++	if (bytes < 24 || memcmp(addon, "NGPUADD2", 8)) {
++		printf("opi5plus: addon: not an NGPUADD2 image\n");
++		return EINVAL;
++	}
++	memcpy(&count, addon + 8, 4);
++	memcpy(&total, addon + 16, 8);
++	if (total != bytes || !count || count > 4096) {
++		printf("opi5plus: addon: header says %u files and %llu bytes, the range holds %llu\n", count, total, bytes);
++		return EINVAL;
++	}
++	/* Everything is validated before the first byte is written. */
++	uint64_t at = 24;
++	for (uint32_t i = 0; i < count; ++i) {
++		uint32_t name_bytes = 0, mode = 0;
++		uint64_t size = 0, packed = 0;
++		uint64_t name_padded, size_padded;
++		const char *name;
++
++		if (bytes - at < 24) {
++			return EINVAL;
++		}
++		memcpy(&name_bytes, addon + at, 4);
++		memcpy(&mode, addon + at + 4, 4);
++		memcpy(&size, addon + at + 8, 8);
++		memcpy(&packed, addon + at + 16, 8);
++		at += 24;
++		name_padded = (name_bytes + 7) & ~7ULL;
++		size_padded = (packed + 7) & ~7ULL;
++		name = (const char *)(addon + at);
++		if (name_bytes < 2 || name_bytes > 160 || bytes - at < name_padded || name[name_bytes - 1] || strnlen(name, name_bytes) != name_bytes - 1 ||
++		    name[0] == '/' || (mode & ~0777) || size > INT32_MAX || !packed || packed > INT32_MAX || bytes - at - name_padded < size_padded) {
++			return EINVAL;
++		}
++		for (uint32_t k = 0; k + 1 < name_bytes - 1; ++k) {
++			if (name[k] == '.' && name[k + 1] == '.') {
++				return EINVAL;
++			}
++		}
++		at += name_padded + size_padded;
++	}
++	if (at != bytes) {
++		return EINVAL;
++	}
++	opi5plus_addon_files = (int)count;
++	error = opi5plus_ensure_dir(p, scratch, ctx, OPI5PLUS_NGPU_DIR, 0755, 0, 0);
++
++	at = 24;
++	for (uint32_t i = 0; i < count && !error; ++i) {
++		uint32_t name_bytes = 0, mode = 0;
++		uint64_t size = 0, packed = 0;
++		char path[192];
++
++		memcpy(&name_bytes, addon + at, 4);
++		memcpy(&mode, addon + at + 4, 4);
++		memcpy(&size, addon + at + 8, 8);
++		memcpy(&packed, addon + at + 16, 8);
++		at += 24;
++		const char *name = (const char *)(addon + at);
++
++		at += (name_bytes + 7) & ~7ULL;
++		snprintf(path, sizeof(path), OPI5PLUS_NGPU_DIR "/%s", name);
++		/* the directories on the way */
++		for (size_t k = sizeof(OPI5PLUS_NGPU_DIR); path[k] && !error; ++k) {
++			if (path[k] == '/') {
++				path[k] = 0;
++				error = opi5plus_ensure_dir(p, scratch, ctx, path, 0755, 0, 0);
++				path[k] = '/';
++			}
++		}
++		uint8_t *data = error ? NULL : kalloc_data(size ? size : 1, Z_WAITOK);
++		int result = error ? error : (data ? opi5plus_inflate(data, size, addon + at, packed) : ENOMEM);
++
++		if (!result) {
++			if (opi5plus_file_equal(ctx, path, data, size, mode)) {
++				opi5plus_addon_same++;
++			} else {
++				result = opi5plus_write_bytes(p, scratch, ctx, path, data, size, mode, 0, 0);
++				if (result) {
++					printf("opi5plus: addon: %s: write failed (%d)\n", path, result);
++					opi5plus_addon_failed++;
++				} else {
++					opi5plus_addon_written++;
++				}
++			}
++		} else {
++			printf("opi5plus: addon: %s: %s (%d)\n", path, data ? "inflate failed" : "no memory", result);
++			opi5plus_addon_failed++;
++		}
++		if (data) {
++			kfree_data(data, size ? size : 1);
++		}
++		at += (packed + 7) & ~7ULL;
++		error = 0;   /* a file that fails keeps its old content; the rest goes on */
++	}
++	return opi5plus_addon_failed ? EIO : 0;
++}
++
++/* /private/var/ngpu/addons over /System/Library/Extensions, with the same user-mount payload the APFS
++ * mounts above use. native_bindfs_boot_mount is what lets process 1 make that mount without the
++ * entitlement an ordinary mount of the type needs; it is set around this one call only. */
++static int
++opi5plus_addon_mount(proc_t p, user_addr_t scratch, vfs_context_t ctx)
++{
++	struct mount_args request = {.type = scratch + 0x100, .path = scratch + 0x120, .flags = MNT_RDONLY | MNT_UNION, .data = scratch + 0x200};
++	int32_t result = 0;
++	vnode_t probe = NULLVP;
++	int error;
++
++	opi5plus_addon_stage = 1;
++	if ((error = vnode_lookup(OPI5PLUS_ADDON_SOURCE, 0, &probe, ctx)) != 0) {
++		return error;
++	}
++	vnode_put(probe);
++	probe = NULLVP;
++	opi5plus_addon_stage = 2;
++	if ((error = copyout("bindfs", request.type, 7)) || (error = copyout(OPI5PLUS_ADDON_POINT, request.path, sizeof(OPI5PLUS_ADDON_POINT))) ||
++	    (error = copyout(OPI5PLUS_ADDON_SOURCE, request.data, sizeof(OPI5PLUS_ADDON_SOURCE)))) {
++		return error;
++	}
++	native_bindfs_boot_mount = 1;
++	error = mount(p, &request, &result);
++	native_bindfs_boot_mount = 0;
++	if (error) {
++		return error;
++	}
++	opi5plus_addon_stage = 3;
++	/* The union shows a sealed lower entry next to the owner's ... */
++	if ((error = vnode_lookup(OPI5PLUS_ADDON_POINT "/AGXMetalA10.bundle", 0, &probe, ctx)) == 0) {
++		vnode_put(probe);
++		probe = NULLVP;
++		opi5plus_addon_stage = 4;
++	}
++	/* ... and the owner's own entry is visible through it. */
++	if ((error = vnode_lookup(OPI5PLUS_ADDON_BUNDLE "/Info.plist", 0, &probe, ctx)) == 0) {
++		vnode_put(probe);
++		opi5plus_addon_stage = 5;
++	}
++	return error;
++}
++
++/* One line per path before it is overwritten: whether vnode_lookup finds it, its size, and whether the
++ * key is already in it. The 30-bit surface round had none of this -- the key-present branch skipped the
++ * write and counted no failure -- so "0 failure(s)" could not be told from "the write happened". */
++static void
++opi5plus_gpu_prefs_report(vfs_context_t ctx, const char *path, const char *key)
++{
++	vnode_t vp = NULLVP;
++	struct vnode_attr va;
++	int error = vnode_lookup(path, 0, &vp, ctx);
++
++	if (error) {
++		printf("opi5plus: gpu prefs: %s: absent (vnode_lookup %d), writing it\n", path, error);
++		return;
++	}
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_data_size);
++	if (vnode_getattr(vp, &va, ctx)) {
++		printf("opi5plus: gpu prefs: %s: present, size unknown, rewriting it\n", path);
++	} else if (key != NULL && opi5plus_file_has_text(ctx, path, key)) {
++		printf("opi5plus: gpu prefs: %s: %llu bytes, already holds %s, rewritten anyway\n", path, (unsigned long long)va.va_data_size, key);
++	} else {
++		printf("opi5plus: gpu prefs: %s: %llu bytes, rewriting it\n", path, (unsigned long long)va.va_data_size);
++	}
++	vnode_put(vp);
++}
++
++/* backboardd on 8-bit BGRA: the render server picks a wide-gamut deep framebuffer and compressed
++ * surfaces unless told not to, and this board's scanout takes neither. The files go into both homes'
++ * preference domains, because the render server may run as mobile or as root. */
++static void
++opi5plus_gpu_prefs_write(proc_t p, user_addr_t scratch, vfs_context_t ctx)
++{
++	static const struct {
++		const char *dir;
++		const char *library;
++		uid_t uid;
++		gid_t gid;
++	} homes[] = {
++		{"/private/var/mobile/Library/Preferences", "/private/var/mobile/Library", 501, 501},
++		{"/private/var/root/Library/Preferences", "/private/var/root/Library", 0, 0},
++	};
++	static const char body[] = OPI5PLUS_PL_HEAD OPI5PLUS_PL_FALSE("CAEnableDeepFramebuffer") OPI5PLUS_PL_FALSE("CAEnableFramebufferCompression")
++	    OPI5PLUS_PL_FALSE("CAEnableIOSurfaceCompression") OPI5PLUS_PL_TAIL;
++	/* The global domain: a process's own domain falls back to it, and the sandbox may allow only that
++	 * one. The OS image's file already holds AppleLanguages and AppleLocale, so they are kept. */
++	static const char global_body[] = OPI5PLUS_PL_HEAD "\t<key>AppleLanguages</key>\n\t<array>\n\t\t<string>en</string>\n\t</array>\n"
++	    "\t<key>AppleLocale</key>\n\t<string>en_US</string>\n" OPI5PLUS_PL_FALSE("CAEnableDeepFramebuffer")
++	    OPI5PLUS_PL_FALSE("CAEnableFramebufferCompression") OPI5PLUS_PL_FALSE("CAEnableIOSurfaceCompression") OPI5PLUS_PL_TAIL;
++	int want = 1, failures = 0, rewritten = 0;
++
++	(void)PE_parse_boot_argn("sd-gpu-prefs", &want, sizeof(want));
++	if (!want) {
++		printf("opi5plus: gpu prefs: sd-gpu-prefs=0, nothing written\n");
++		return;
++	}
++	for (size_t i = 0; i < sizeof(homes) / sizeof(homes[0]); ++i) {
++		char path[96];
++		int error = opi5plus_ensure_dir(p, scratch, ctx, homes[i].library, 0755, homes[i].uid, homes[i].gid);
++
++		if (!error) {
++			error = opi5plus_ensure_dir(p, scratch, ctx, homes[i].dir, 0755, homes[i].uid, homes[i].gid);
++		}
++		if (error) {
++			printf("opi5plus: gpu prefs: %s: no directory (%d)\n", homes[i].dir, error);
++			failures++;
++			continue;
++		}
++		snprintf(path, sizeof(path), "%s/backboardd.plist", homes[i].dir);
++		opi5plus_gpu_prefs_report(ctx, path, NULL);
++		error = opi5plus_write_bytes(p, scratch, ctx, path, body, strlen(body), 0600, homes[i].uid, homes[i].gid);
++		printf("opi5plus: gpu prefs: %s: %s %llu bytes, error %d\n", path, error ? "could not write" : "wrote",
++		    (unsigned long long)strlen(body), error);
++		failures += error ? 1 : 0;
++		if (!error) {
++			/* The global domain goes out on every boot, whether or not it already holds the key: the
++			 * skip that used to sit here left the 30-bit surface choice in place and printed nothing. */
++			snprintf(path, sizeof(path), "%s/.GlobalPreferences.plist", homes[i].dir);
++			opi5plus_gpu_prefs_report(ctx, path, "CAEnableDeepFramebuffer");
++			error = opi5plus_write_bytes(p, scratch, ctx, path, global_body, strlen(global_body), 0644, homes[i].uid, homes[i].gid);
++			printf("opi5plus: gpu prefs: %s: %s %llu bytes, error %d\n", path, error ? "could not write" : "wrote",
++			    (unsigned long long)strlen(global_body), error);
++			if (error) {
++				failures++;
++			} else {
++				rewritten++;
++			}
++		}
++	}
++	printf("opi5plus: gpu prefs: backboardd.plist (deep framebuffer and compression off) for mobile and root: "
++	    "%d failure(s), %d rewritten\n", failures, rewritten);
++}
++
++/* The entry point the hook calls once /private/var is the Data volume. Never fatal: every failure is
++ * printed and the boot goes on. */
++int
++opi5plus_gpu_addon(proc_t p, user_addr_t scratch)
++{
++	vfs_context_t ctx = vfs_context_current();
++	uint32_t want = 1;
++	uint32_t mount = 1;
++	int error;
++
++	(void)PE_parse_boot_argn("sd-gpu-addon", &want, sizeof(want));
++	if (!want) {
++		printf("opi5plus: addon: sd-gpu-addon=0, nothing written\n");
++		return 0;
++	}
++	opi5plus_gpu_prefs_write(p, scratch, ctx);
++	error = opi5plus_addon_install(p, scratch, ctx);
++	if (opi5plus_addon_files < 0) {
++		printf("opi5plus: addon: none in the payload; /System/Library/Extensions left as it is\n");
++		return error;
++	}
++	printf("opi5plus: addon: %d file(s): %d written, %d already in place, %d failed: %d\n", opi5plus_addon_files, opi5plus_addon_written,
++	    opi5plus_addon_same, opi5plus_addon_failed, error);
++	/* The union over /System/Library/Extensions is what makes the bundle visible to Metal discovery, and
++	 * it is also the one part of this block that changes a path every process uses. sd-gpu-mount=0 keeps
++	 * the files on the Data volume and skips the mount, which is how the two are told apart on the board. */
++	(void)PE_parse_boot_argn("sd-gpu-mount", &mount, sizeof(mount));
++	if (!mount) {
++		printf("opi5plus: addon: sd-gpu-mount=0, the bundle stays on the Data volume and "
++		    OPI5PLUS_ADDON_POINT " is left as it is\n");
++		return 0;
++	}
++	opi5plus_addon_status = opi5plus_addon_mount(p, scratch, ctx);
++	printf("opi5plus: addon: mounted over " OPI5PLUS_ADDON_POINT ": stage %d status %d (5 = our bundle visible next to the sealed ones)\n",
++	    opi5plus_addon_stage, opi5plus_addon_status);
++	return opi5plus_addon_status;
++}
+ #endif /* DEVELOPMENT || DEBUG */
+ 
+ #if DEVELOPMENT || DEBUG

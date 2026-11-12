@@ -1,0 +1,85 @@
+# Kernel configuration of the Orange Pi 5 Plus image, applied after the ARM64, SoC and OS fragments
+# (board.toml [kernel] config_fragments). CONFIG_XNU_<NAME> becomes XNU_<NAME> in the kernel build;
+# y and n become 1 and 0, {tree} in a string becomes the build tree.
+#
+# One configuration, not two: the EVB10 keeps a display-less pass and a display pass because its VOP2
+# scan-out archive has to be built against an already-built kernel. This board's display path is the
+# firmware's GOP frame buffer (GopFramebuffer, in [components] include), and its archive is not built from
+# a kernel recipe, so a single pass suffices until M5 decides whether a VOP2 fallback is needed.
+
+# --- what the ARM64 and OS profiles enable that this board does not use ------------------------------
+# The OS profile turns on the Adreno driver; this board has a Mali-G610 and no UFS. The SoC fragment
+# switches the Qualcomm AES engine and the armv8 virt platform off as well; they are repeated here so
+# that a change in the SoC layer cannot silently re-enable them on this board.
+CONFIG_XNU_NATIVE_ADRENO=n
+# --- mockfs: the root filesystem stand-in until M4 provides a real one ------------------------------
+# M3 reached the kernel but stopped at IOKitBSDInit.cpp:984 with
+#   panic: Failed to mount root device
+# because no IOMedia carries Content=Apple_HFS (the kernel has only com.apple.filesystems.apfs, and no
+# block storage driver is linked yet). vfs_conf.c:196-213 registers mockfs LAST among the mountroot
+# candidates and gives it mockfs_mountroot(), so with MOCKFS=1 the kernel can mount a synthetic
+# root instead of panicking: three nodes -- "/", a devfs mountpoint, and a file node that
+# mockfs_vnops.c:116-124 resolves from "launchd" (and "sbin" back to "/"), which is exactly where
+# kern_exec.c:7164 looks for the init program ("/sbin/launchd").
+# The fixture is scripts/build-mockfs-fixture.py -> build/mockfs-fixture/libmockfs_fixture.a; it builds
+# fine on the Linux toolchain because /usr/bin/xcrun is the shim that setup-toolchain.py installs
+# (verified 2026-11-02: 3 sources, 204,268-byte archive). build-xnu-4k-baseline.sh:241-243 requires
+# ArmCpu and source libpthread when this is 1; this board has both.
+# Set back to n once M4 gives the kernel a real root device.
+CONFIG_XNU_SOURCE_MOCKFS=y
+CONFIG_XNU_ARMVIRT_PLATFORM=n
+CONFIG_XNU_NATIVE_UFS=n
+CONFIG_XNU_NATIVE_VIRTIO_BLOCK=n
+CONFIG_XNU_NATIVE_RAM_BLOCK=n
+CONFIG_XNU_NATIVE_VIRTIO_CONSOLE=n
+
+# --- display -----------------------------------------------------------------------------------------
+# 0 until M5 writes a presenter for this board. The EVB10's evb10_display_defconfig sets these to y and
+# links libNativeLegacyDisplay.late.a, which scripts/build-evb10-display.py builds from the EVB10's own
+# sources; there is no equivalent archive for this board yet, and build-xnu-4k-baseline.sh refuses to link
+# a missing one (`test -f $ROOT/build/native-legacy-display/libNativeLegacyDisplay.late.a`). The GOP
+# component is selected in [components] include so its sources are in the tree when that work starts.
+CONFIG_XNU_NATIVE_MOBILE_DISPLAY=n
+CONFIG_XNU_NATIVE_LEGACY_DISPLAY=n
+
+# --- drivers linked next to the kernel ----------------------------------------------------------------
+# The no-op link stubs exist because the SoC patch series is shared by
+# every RK3588 board and rk3588-root-trust.patch calls native_emmc_root_trusted(), which package/Rk3588Emmc
+# defines. This board has no eMMC module, so that driver is not built and the symbol would be undefined at
+# kernel link ("Undefined symbols for architecture arm64: _native_emmc_root_trusted, referenced from
+# _bsd_init"). package/LinkStubs.c supplies a WEAK definition that returns 0 ("not vouched for"), which keeps
+# bsd_init's require_rootauth = TRUE. Weak, so the real driver replaces it once M4 fits the module.
+#
+# Archives this board's own steps build, in the order board.toml [kernel] archives builds them:
+#   M4 Plan B  {tree}/build/native-sd/libNativeSd.a          (SD host for mmc@fe2c0000: build-sd-driver.py
+#                                                            compiles it, bind-sd-storage.py makes the archive.
+#                                                            Earlier comments here planned the name
+#                                                            build/rk3588-sd/libRk3588Sd.a; that directory does
+#                                                            not exist and the builder writes native-sd.)
+# Archives nothing builds yet, kept here so the shape is obvious:
+#   M4 Plan A  {tree}/build/rk3588-emmc/libRk3588Emmc.a      (eMMC module fitted; reuse the EVB10 driver)
+#   M5         {tree}/build/native-legacy-display/libNativeLegacyDisplay.late.a  (GOP presenter)
+#   M7         {tree}/build/mali/libMali.a                   (same Mali-G610 driver as the EVB10)
+# No entry for input: M6 starts with a scripted injection channel, which is not a kernel archive.
+# Link-time archives. Each entry is force-loaded, so the linker keeps every object in it even when
+# nothing references a symbol yet -- which is the point for drivers: NativeSd is reached through the
+# KernelConfigTables personality, not through a C reference.
+#
+# libLinkStubs.a   weak no-op definitions of hooks the shared RK3588 patch series calls but this board
+#                  does not build (package/LinkStubs.c explains which and why weak).
+# libNativeSd.a    the SD host. Made by scripts/bind-sd-storage.py, not by the compiler alone: the
+#                  driver subclasses the original IOBlockStorageDevice, whose code is in the kernel
+#                  but is not exported, so the archive also carries absolute-symbol bindings. The
+#                  space is significant in the value below: it separates the two -force_load groups
+#                  inside one shell word.
+CONFIG_XNU_EXTRA_LD_ARCHIVES="-Wl,-force_load,{tree}/build/link-stubs/libLinkStubs.a -Wl,-force_load,{tree}/build/native-sd/libNativeSd.a"
+
+# --- kernel facilities the port expects ----------------------------------------------------------------
+# 4 KiB signature hashes derived from verified 16 KiB blocks; no archive, no hardware assumption.
+CONFIG_XNU_NATIVE_CS_HASH_CACHE=y
+# The trust-cache runtime: without it the lock stays zeroed (a non-sleepable lck_rw_t) and the first
+# query from AMFI for the cdhash of /sbin/launchd panics ("Taking non-sleepable RW lock with
+# preemption enabled"). The trust caches of the IPSW reach it through the payload.
+CONFIG_XNU_TRUST_CACHE_RUNTIME=y
+# Read a panic region from /chosen when the tree carries one. The generator does not emit one.
+CONFIG_XNU_DT_PANIC_REGION=n

@@ -1,0 +1,22 @@
+--- a/iokit/KernelConfigTables.cpp	2026-11-02 20:41:21.965214296 +0800
++++ b/iokit/KernelConfigTables.cpp	2026-11-02 20:41:21.980866335 +0800
+@@ -72,6 +72,19 @@
+     "     'IONameMatch'     = 'rockchip,rk3588-dwcmshc';"
+     "     'IOProbeScore'    = 1000:32;"
+     "   },"
++    /*
++     * RK3588: the DesignWare MSHC SD host at 0xFE2C0000 (compatible
++     * "rockchip,rk3588-dw-mshc"). A sibling of the eMMC entry above, for the same reason:
++     * built in unconditionally, found only when CONFIG_XNU_EXTRA_LD_ARCHIVES force-loads
++     * libNativeSd.a. The nub comes from /arm-io/sdmmc in the device tree -- see the `sd`
++     * node of dts/opi5plus.dts and its unixnu,adt-name.
++     */
++    "   {"
++    "     'IOClass'         = NativeSd;"
++    "     'IOProviderClass' = IOPlatformDevice;"
++    "     'IONameMatch'     = 'rockchip,rk3588-dw-mshc';"
++    "     'IOProbeScore'    = 1000:32;"
++    "   },"
+     "   {"
+     "     'IOClass'         = IOExclaveProxy;"
+     "     'IOProviderClass' = IOService;"

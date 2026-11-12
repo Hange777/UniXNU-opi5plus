@@ -1,0 +1,86 @@
+# Board XNU patches of the Orange Pi 5 Plus, applied after the ARM64, SoC and OS series.
+#
+# The device series is the fourth and last one, and every patch in it has to be a board fact that
+# neither the SoC nor the OS layer can own (plan.md M2).
+#
+#   0001-sd-personality   adds a KernelConfigTables entry for the DesignWare MSHC SD host at
+#                         0xFE2C0000, modelled on the SoC's rk3588-emmc-personality. It is a board
+#                         fact and not a SoC one because the eMMC entry sits there for the EVB10's
+#                         card; this board's card is on the SD controller and the two drivers are
+#                         separate IOKit classes. The patch inserts the entry immediately after the
+#                         eMMC one, ahead of IOExclaveProxy, for the reason the SoC patch records:
+#                         the patches that add to the ends of that table check their context on
+#                         every rebuild.
+#   0002-mount-data-volume  mounts the payload's Data volume on /private/var before the first exec of
+#                         the init program. The mount has to happen from process 1 itself (the APFS
+#                         mount payload holds a user pointer to the device string), so it cannot live
+#                         in the driver; the device path comes from native_sd_data_device() in
+#                         package/NativeSd. launchd needs the writable volume for its swap file and
+#                         for the dyld shared-region cache -- without it the boot stops right after
+#                         libignition's first message. This is the Data half of the EVB10's userland
+#                         hook, without its SystemOS union and without its process table.
+#
+#   0003-gpu-addon       delivers the Mali's Metal plug-in. The bundle travels in the payload at
+#                         /chosen/memory-map/GpuAddon (unixnu payload --gpu-addon), package/Mali's
+#                         mali_gpu_addon() reads it back, and the hook unpacks the NGPUADD2 image into
+#                         /private/var/ngpu/addons, union-mounts that over /System/Library/Extensions
+#                         (bindfs, read-only, already in this kernel) and writes the CoreAnimation
+#                         properties that keep the render server on 8-bit BGRA. The EVB10's
+#                         evb10-userland-mounts patch is the same design, but it is a whole board's
+#                         userland (APFS mounts, SystemOS union, ps, screen shots, exit trace) and its
+#                         Data half calls native_emmc_*, which this board does not have: what is here
+#                         is the add-on and the preferences only, wired into 0002's hook.
+#
+#   0004-thread-sample  says where the threads of a named process are: for each thread, the registers of
+#                         its last trap from user mode and the frame-pointer chain of its user stack, which
+#                         is what "SpringBoard has stopped drawing" has to be separated from "SpringBoard is
+#                         waiting for something" with. The block lives in osfmk/kern/bsd_kern.c (struct
+#                         thread, struct task and the saved user state are private there); the caller is
+#                         0002's heartbeat, which already walks allproc. It walks no kernel stack: a thread
+#                         that blocked with a continuation has none. Boot args opi5plus-bt/-bt2 ... -bt8
+#                         name up to eight processes (16 characters each, the width of the buffer the boot
+#                         argument is read into), opi5plus-bt-secs=N sets the period and is off by default
+#                         (evidence/m7/M7-08).
+#
+#   0005-crash-trace    says where a process died, not just that it did: the saved user registers of the
+#                         signal death and the frame-pointer chain of its stack, from the same block 0004
+#                         appended to bsd_kern.c, called from exit_with_reason(). The daemons that trap every
+#                         few seconds (mobileactivation, assistantd, dmd, PerfPowerService,
+#                         privacyaccountingd) write to logd and never to the console, and SpringBoard's main
+#                         thread is blocked on a synchronous XPC reply from exactly one of them
+#                         (evidence/m7/M7-08).
+#
+#   0006-block-exec     refuses one exec: opi5plus-block-exec=mobileactivationd makes that program's execve
+#                         return EPERM, so launchd cannot start the job behind its XPC service and fails the
+#                         request instead of queueing it. SpringBoard's main thread otherwise waits on
+#                         -[MadGate getActivationState:] for the rest of the boot, because mobileactivationd
+#                         dies by design in its own main() error path and launchd keeps restarting it on
+#                         demand (evidence/m7/M7-08, M7-09). Off unless the argument names something.
+#
+#   0007-exec-stub      puts the payload's addons/exec directory over /usr/libexec as a read-only union, so a
+#                         sealed daemon can be replaced without touching the sealed volume. The stand-in for
+#                         /usr/libexec/mobileactivationd travels in the GPU add-on blob (which the installer
+#                         above already writes to the Data volume) and answers the activation XPC that
+#                         SpringBoard's main thread waits on forever (evidence/m7/M7-08, M7-09). It prints the
+#                         size of the path before and after the mount, because that is how the union's
+#                         precedence reads from the board: 2960496 bytes is the sealed daemon, ~70 KiB is the
+#                         stand-in. sd-exec-stub=0 turns it off.
+#
+# What this series is expected to gain, and when:
+#   M4  further patches only if publishing the SD windows cannot be done in the driver itself.
+#   M5  a presentable frame buffer: GopFramebuffer's NativeLegacyDisplay needs the Apple-side classes
+#       the EVB10's userland-mounts patch also touches.
+#   M6  the input injection channel.
+#
+# Not copied from the EVB10: evb10-exit-trace, evb10-mmap-grant, evb10-vc-mirror (nothing links a display
+# on this board yet, see configs/opi5plus_defconfig), and evb10-userland-mounts as a whole -- 0002 and
+# 0003 above are the parts of it this board needs, rewritten against this board's Data volume and its
+# native_sd_* providers. 0004 is the one piece this board took from evb10-thread-sample, reduced to the
+# user-stack half.
+0001-sd-personality.patch
+0002-mount-data-volume.patch
+0003-gpu-addon.patch
+0004-thread-sample.patch
+0005-crash-trace.patch
+0006-block-exec.patch
+0007-exec-stub.patch

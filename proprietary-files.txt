@@ -1,0 +1,26 @@
+# Firmware paths and SHA-256 digests for a future scripts/extract-files.py.
+# Files are written under .cache/firmware/.
+# Format: path|sha256. Prefix a path with - for an optional file.
+# Pass SOURCE to extract-files.py: the directory that holds the listed paths.
+#
+# The Mali-G610 CSF firmware is the first entry (Arm Valhall, arch 10.8, 274432 bytes). This board's
+# copy was taken from the Rockchip BSP Ubuntu image the board itself runs, not from an AOSP vendor
+# tree: /lib/firmware/mali_csffw_g15p0/mali_csffw.bin. The same image also carries mali_csffw_g17p0
+# (270336 B, c1f0896b...) and mali_csffw_g18p0 (266240 B, 122f1ecc..., the one /lib/firmware/mali_csffw.bin
+# symlinks to); neither is this arch-10.8 build and neither is listed here.
+#
+# The EVB10 records 8e7c821a55ca1c345cc79f61243616dd25fc35b81f090946f302886d67712df5 for its copy. This
+# board's file is NOT that build: same size and same CSF format, different content, so the EVB10 digest
+# would fail here and is deliberately not used.
+#
+# Checked before the entry was written: the first u32 is kFwMagic 0xc3f13a6e (package/Mali/Mali.cpp:427),
+# the size matches the driver's expectation, and package/Mali/tools/gen-fw-inc.py accepted it with only
+# its "differs from the tested firmware" warning.
+
+mali_csffw.bin|ad91511a77fa110af46a2a29cad9e225524d9cfa9fe35bdce96606d354e607de
+
+# Not listed, on purpose:
+# - Nothing for storage: this port has no eMMC and no NVMe driver, and SD needs no firmware.
+# - Nothing for display: the HDMI path uses the firmware's GOP frame buffer, not a vendor blob.
+# - Nothing for input: no touch controller is fitted.
+# - Nothing for network: the RTL8125 and the AX210 are M8 optional work (plan.md §1, "not doing").

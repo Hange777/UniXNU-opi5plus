@@ -1,0 +1,1932 @@
+# The Linux toolchain names Apple's CodeSignature headers EXTERNAL_HEADERS/CoreEntitlements, while
+# kern_exec.c of this revision includes <CodeSignature/Entitlements.h>. The link below is created by
+# the patch so that every build of the work tree (which is re-cloned from refer/xnu) finds it.
+
+diff --git a/CodeSignature b/CodeSignature
+new file mode 120000
+index 0000000..961ba71
+--- /dev/null
++++ b/CodeSignature
+@@ -0,0 +1 @@
++CoreEntitlements
+\ No newline at end of file
+
+diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
+index 8a1ec42..72683eb 100644
+--- a/bsd/dev/arm/systemcalls.c
++++ b/bsd/dev/arm/systemcalls.c
+@@ -101,6 +101,12 @@ unix_syscall(
+ 	uthread_reset_proc_refcount(uthread);
+ 
+ 	code = arm_get_syscall_number(state);
++#if DEVELOPMENT || DEBUG
++	{
++		extern void opi5plus_trace_syscall(struct proc *, int, struct arm_saved_state *);
++		opi5plus_trace_syscall(proc, (int)code, state);
++	}
++#endif
+ 
+ #define unix_syscall_kprintf(x...)      /* kprintf("unix_syscall: " x) */
+ 
+@@ -180,6 +186,14 @@ unix_syscall(
+ 	AUDIT_SYSCALL_ENTER(code, proc, uthread);
+ 	error = (*(callp->sy_call))(proc, &uthread->uu_arg[0], &(uthread->uu_rval[0]));
+ 	AUDIT_SYSCALL_EXIT(code, proc, uthread, error);
++#if DEVELOPMENT || DEBUG
++	{
++		/* Orange Pi 5 Plus: the errno only exists here, and the saved state still holds
++		 * the arguments -- arm_prepare_syscall_return() overwrites x0 further down. */
++		extern void opi5plus_trace_syscall_return(int, int);
++		opi5plus_trace_syscall_return((int)code, error);
++	}
++#endif
+ 
+ #if CONFIG_MACF
+ skip_syscall:
+@@ -582,3 +596,210 @@ arm_clear_syscall_error(struct arm_saved_state * state)
+ #else
+ #error Unknown architecture.
+ #endif
++
++#if DEVELOPMENT || DEBUG
++/*
++ * Why a boot stops before the UI: the six daemons that walk the Data volume, and only the calls that fail.
++ * A path argument is a user pointer, so it is read back with copyinstr() at the point where the errno exists.
++ * Names are matched as prefixes: the kernel cuts p_comm to about fifteen characters.
++ */
++#define OPI5PLUS_SYSCALL_PER_NAME 40
++#define OPI5PLUS_SYSCALL_SLOTS 16
++#define OPI5PLUS_SYSCALL_PATH 96
++#define OPI5PLUS_SYSCALL_F_GETPATH 50
++
++static const char *opi5plus_syscall_watch[] = {
++	"biomed",
++	"callservicesd",
++	"nsurlsessiond",
++	"biomesyncd",
++	"keybagd",
++	"contextstored",
++};
++#define OPI5PLUS_SYSCALL_NAMES (sizeof(opi5plus_syscall_watch) / sizeof(opi5plus_syscall_watch[0]))
++
++/*
++ * One slot per thread: the entry hook records the call number and where its path argument lives, the return
++ * hook reads it back once the errno is known. Keyed by thread, not by pid -- these daemons run the same call
++ * from several threads at once, and a pid-keyed table would print one thread's path next to another's errno.
++ */
++struct opi5plus_syscall_slot {
++	thread_t thread;
++	uint64_t path;
++	int nr;
++	int reg;
++	int watch;
++	int pid;
++	char comm[24];
++	int live;
++};
++static struct opi5plus_syscall_slot opi5plus_syscall_slots[OPI5PLUS_SYSCALL_SLOTS];
++static int opi5plus_syscall_counts[OPI5PLUS_SYSCALL_NAMES];
++static int opi5plus_syscall_enabled = -1;
++
++static int
++opi5plus_syscall_ready(void)
++{
++	if (opi5plus_syscall_enabled < 0) {
++		uint32_t value = 0;
++		(void) PE_parse_boot_argn("sd-syscall", &value, sizeof(value));
++		opi5plus_syscall_enabled = value != 0;
++	}
++	return opi5plus_syscall_enabled;
++}
++
++/* strncmp() without <string.h>, for the same answer with one loop. */
++static int
++opi5plus_syscall_prefix(const char *text, const char *prefix)
++{
++	while (*prefix != 0) {
++		if (*text++ != *prefix++) {
++			return 0;
++		}
++	}
++	return 1;
++}
++
++/* The index of the watched name this process matches, -1 for a process that is not watched. */
++static int
++opi5plus_syscall_watched(const char *comm)
++{
++	for (unsigned i = 0; i < OPI5PLUS_SYSCALL_NAMES; ++i) {
++		if (opi5plus_syscall_prefix(comm, opi5plus_syscall_watch[i])) {
++			return (int)i;
++		}
++	}
++	return -1;
++}
++
++/*
++ * Where the path argument of a call number sits in the saved state, -1 when the call takes none.
++ * fcntl(2) is the special case: x1 is the command, and F_GETPATH (50) has the file system write the path into
++ * the buffer at x2, so that path only exists once the call has run.
++ * fchmod(124) takes a descriptor and a mode and no path at all, and syscall 50 is setlogin -- realpath(3)
++ * reaches the kernel through F_GETPATH, not through a call number of its own.
++ */
++static int
++opi5plus_syscall_path_register(int nr, struct arm_saved_state *state)
++{
++	switch (nr) {
++	case 5:                 /* open */
++	case 136:               /* mkdir */
++	case 188: case 190:     /* stat, lstat */
++	case 338: case 340:     /* stat64, lstat64 */
++	case 33:                /* access */
++	case 58:                /* readlink */
++	case 220:               /* getattrlist */
++	case 10:                /* unlink */
++	case 128:               /* rename */
++	case 15:                /* chmod */
++		return 0;
++	case 463:               /* openat */
++	case 216:               /* open_dprotected_np */
++	case 475:               /* mkdirat */
++		return 1;
++	case 92:                /* fcntl */
++		if (state != NULL && (int)get_saved_state_reg(state, 1) == OPI5PLUS_SYSCALL_F_GETPATH) {
++			return 2;
++		}
++		return -1;
++	default:
++		return -1;
++	}
++}
++
++static struct opi5plus_syscall_slot *
++opi5plus_syscall_slot(thread_t thread)
++{
++	struct opi5plus_syscall_slot *free_slot = NULL;
++
++	for (unsigned i = 0; i < OPI5PLUS_SYSCALL_SLOTS; ++i) {
++		if (opi5plus_syscall_slots[i].live && opi5plus_syscall_slots[i].thread == thread) {
++			return &opi5plus_syscall_slots[i];
++		}
++		if (!opi5plus_syscall_slots[i].live && free_slot == NULL) {
++			free_slot = &opi5plus_syscall_slots[i];
++		}
++	}
++	return free_slot;
++}
++
++void
++opi5plus_trace_syscall(struct proc *p, int code, struct arm_saved_state *state)
++{
++	struct opi5plus_syscall_slot *slot;
++	int watch;
++	int reg;
++
++	if (!opi5plus_syscall_ready() || p == NULL) {
++		return;
++	}
++	watch = opi5plus_syscall_watched(p->p_comm);
++	if (watch < 0) {
++		return;
++	}
++	slot = opi5plus_syscall_slot(current_thread());
++	if (slot == NULL) {
++		return;
++	}
++	reg = opi5plus_syscall_path_register(code, state);
++	slot->thread = current_thread();
++	slot->nr = code;
++	slot->reg = reg;
++	slot->watch = watch;
++	slot->pid = p->p_pid;
++	slot->comm[0] = 0;
++	for (int i = 0; i < (int)sizeof(slot->comm) - 1 && p->p_comm[i] != 0; ++i) {
++		slot->comm[i] = p->p_comm[i];
++		slot->comm[i + 1] = 0;
++	}
++	slot->path = (reg < 0 || state == NULL) ? 0 : (uint64_t)get_saved_state_reg(state, reg);
++	slot->live = 1;
++}
++
++/*
++ * Called from unix_syscall() right after the system call returned: the one place where the errno and the still
++ * untouched argument registers exist together -- arm_prepare_syscall_return(), which overwrites x0 with the
++ * error, runs further down that function.
++ */
++void
++opi5plus_trace_syscall_return(int code, int error)
++{
++	struct opi5plus_syscall_slot *slot;
++	char path[OPI5PLUS_SYSCALL_PATH];
++	size_t taken = 0;
++
++	if (!opi5plus_syscall_ready()) {
++		return;
++	}
++	slot = opi5plus_syscall_slot(current_thread());
++	if (slot == NULL || !slot->live || slot->nr != code) {
++		return;
++	}
++	slot->live = 0;
++	/* ERESTART and EJUSTRETURN are negative and mean the call did not return here; only an errno counts. */
++	if (error <= 0) {
++		return;
++	}
++	/*
++	 * ENOENT is the normal answer to a daemon probing for a file or a directory it does not need yet, not a
++	 * failing call: in round 1 it alone took 31 of callservicesd's 40 lines and 33 of contextstored's, and
++	 * the calls that actually failed never reached the log. The quota and the counters are unchanged.
++	 */
++	if (error == ENOENT) {
++		return;
++	}
++	if (opi5plus_syscall_counts[slot->watch] >= OPI5PLUS_SYSCALL_PER_NAME) {
++		return;
++	}
++	opi5plus_syscall_counts[slot->watch]++;
++	if (slot->reg >= 0 && slot->path != 0 &&
++	    copyinstr((user_addr_t)slot->path, path, sizeof(path), &taken) == 0) {
++		printf("opi5plus: sysnum %s[%d] nr %d errno %d path %s\n", slot->comm, slot->pid, code, error,
++		    path);
++	} else {
++		printf("opi5plus: sysnum %s[%d] nr %d errno %d path <nopath>\n", slot->comm, slot->pid, code,
++		    error);
++	}
++}
++#endif /* DEVELOPMENT || DEBUG */
+diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+index 8bba078..33ba031 100644
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -5121,6 +5121,12 @@ proc_exec_switch_task(proc_t old_proc, proc_t new_proc, task_t old_task, task_t
+ int
+ execve(proc_t p, struct execve_args *uap, int32_t *retval)
+ {
++#if DEVELOPMENT || DEBUG
++	{
++		extern int opi5plus_trace_exec(proc_t, struct execve_args *);
++		(void)opi5plus_trace_exec(p, uap);
++	}
++#endif
+ 	struct __mac_execve_args muap;
+ 	int err;
+ 
+@@ -7027,6 +7033,14 @@ load_init_program_at_path(proc_t p, user_addr_t scratch_addr, const char* path)
+ 	assert(p);
+ 	assert(scratch_addr);
+ 	assert(path);
++#if DEVELOPMENT || DEBUG
++	{
++		/* Orange Pi 5 Plus: the SystemOS cryptex and the Data volume, once, before the first exec
++		 * of the init program. */
++		extern int opi5plus_userland_prepare(proc_t, user_addr_t);
++		(void)opi5plus_userland_prepare(p, scratch_addr);
++	}
++#endif
+ 
+ 	/*
+ 	 * Copy out program name.
+@@ -8055,3 +8069,1580 @@ sysctl_libmalloc_experiments SYSCTL_HANDLER_ARGS
+ }
+ 
+ EXPERIMENT_FACTOR_PROC(_kern, libmalloc_experiments, CTLTYPE_QUAD | CTLFLAG_RW, 0, 0, &sysctl_libmalloc_experiments, "A", "");
++
++#if DEVELOPMENT || DEBUG
++#include <kern/task.h>
++#include <kern/thread.h>
++/* struct direntry and the extended-entry walk of the Data seed (opi5plus_seed_copy_dir). */
++#include <sys/dirent.h>
++/*
++ * The beat line's page counters (vfree/vspec/vcomp) are osfmk state, behind <vm/vm_page.h>. A bsd object does
++ * not compile against that header -- it is not exported, and its kern/misc_protos.h declares setbit(), which
++ * bsd/sys/param.h already defines as a macro -- so opi5plus_vm_page_counts(), in osfmk/kern/debug.c, reads them
++ * where the header is legal and hands the three numbers over.
++ */
++extern void opi5plus_vm_page_counts(unsigned long long *free_pages, unsigned long long *speculative_pages,
++    unsigned long long *compressor_pages);
++/*
++ * Orange Pi 5 Plus: mount the payload's Data volume on /private/var before the first exec of the init
++ * program.
++ *
++ * launchd needs a writable /private/var -- its swap file and the dyld shared-region cache live there -- and
++ * the OS volume of an IPSW is read-only. The payload hands a 32 MiB APFS seed over in RAM; package/NativeSd
++ * publishes it as a writable block device (boot-arg sd-data-ram=1) and APFS mounts its container. The VFS
++ * mount is the part that has to happen here: the APFS mount payload holds a user pointer to the device
++ * string, so it is built in the scratch page of process 1 and mount(2) is called on it, exactly as
++ * UniXNU-evb10's userland hook does for its own Data volume.
++ *
++ * sd-data-mount=0 turns it off. Not fatal on failure: the status goes to the log and a launchd that cannot
++ * start says why.
++ *
++ * <sys/sysproto.h>, which this file already includes, declares mount() and struct mount_args; only the device
++ * lookup is ours.
++ *
++ * The weak fallback below is for the bootstrap pass of the XNU build, which links without the archives (and so
++ * without package/LinkStubs.c); the driver's strong definition replaces it in the real link.
++ */
++extern int native_sd_data_device(char *path, size_t size, int32_t *device);
++extern int native_sd_volume_device(const char *uuid, char *path, size_t size, int32_t *device);
++extern void commpage_update_dyld_flags(uint64_t value);
++extern int native_sd_watchdog_start(uint32_t timeoutIndex);
++extern void native_sd_watchdog_kick(void);
++static void
++opi5plus_check_paths(void);
++static void
++opi5plus_seed_tree(proc_t p, user_addr_t scratch, mount_t data_mount);
++static void
++opi5plus_wipe_mobilegestalt(proc_t p, user_addr_t scratch);
++static void opi5plus_pe_puts(const char *text);
++static void opi5plus_pe_number(unsigned long long value);
++static void opi5plus_report_exits(void);
++
++/*
++ * The firmware's GOP frame buffer, read out of the loader's own handoff line:
++ *   DARWINBOOT: video base=0xE6760000 display=1 row=10240 width=2560 height=1440 depth=32
++ * Nothing in this port drives it yet, so the screen keeps the loader's last frame. sd-paint=1 fills it once,
++ * which is the cheapest possible proof that the kernel can reach it -- and the first thing an IOFramebuffer
++ * needs to know.
++ */
++static void
++opi5plus_paint_screen(void)
++{
++	const uint64_t base = 0xE6760000ull;
++	const uint64_t width = 2560;
++	const uint64_t rowBytes = 10240;
++	const uint64_t height = 1440;
++	const uint64_t total = rowBytes * height;
++	/* One 14 MiB mapping does not fit -- ml_io_map failed in kmem_alloc with KERN_NO_SPACE -- so the screen is
++	 * painted a megabyte at a time, each band mapped, filled and freed before the next one. */
++	const uint64_t chunk = 1ull << 20;
++	extern vm_offset_t ml_io_map(vm_offset_t phys, vm_size_t size);
++	uint64_t painted = 0;
++
++	for (uint64_t offset = 0; offset < total; offset += chunk) {
++		const uint64_t size = (total - offset) < chunk ? (total - offset) : chunk;
++		vm_offset_t mapped = ml_io_map((vm_offset_t)(base + offset), (vm_size_t)size);
++
++		if (mapped == 0) {
++			/* ml_io_map's entries are permanent (vm_map_delete rejects them), so the bands already mapped
++			 * cannot be given back; the paint simply stops where the kernel's mapping space runs out. */
++			break;
++		}
++		{
++			/* Colour bars a third of the screen apart, so the pattern is unmistakable. */
++			const uint64_t phase = (offset * 3) / total;
++			const uint32_t colour = (phase == 0) ? 0x002040C0u : (phase == 1) ? 0x0000C040u : 0x00C04000u;
++			volatile uint32_t *pixels = (volatile uint32_t *)mapped;
++			for (uint64_t word = 0; word < size / 4; ++word) {
++				pixels[word] = colour;
++			}
++		}
++		painted += size;
++	}
++	opi5plus_pe_puts("\r\nopi5plus: framebuffer bands painted, bytes: ");
++	{
++		uint64_t value = painted;
++		char digits[24];
++		int count = 0;
++		if (value == 0) {
++			opi5plus_pe_puts("0");
++		} else {
++			while (value != 0 && count < 24) {
++				digits[count++] = (char)('0' + (value % 10));
++				value /= 10;
++			}
++			while (count > 0) {
++				char text[2] = {digits[--count], 0};
++				opi5plus_pe_puts(text);
++			}
++		}
++	}
++	opi5plus_pe_puts("\r\n");
++	(void)width;
++	(void)rowBytes;
++}
++
++/*
++ * The mode, the owner and the group of one directory of the skeleton. A mode alone is not enough: the Data
++ * volume is persistent, so from the second boot on the directories are already there, and a directory that the
++ * first boot made as root stays root's whatever the table says. Defined here rather than with the Data seed
++ * below, because the skeleton creates its directories before that seed exists and both use the same setter.
++ */
++struct opi5plus_seed_attrs {
++	mode_t mode;
++	uid_t uid;
++	gid_t gid;
++};
++
++/* Defined with the Data seed below, which comes after the skeleton that needs it. */
++static int opi5plus_seed_attrs_set(vnode_t vp, vfs_context_t ctx, const struct opi5plus_seed_attrs *attrs,
++    int link);
++
++/*
++ * The Data volume of this port is an empty APFS container, while a real data seed carries the skeleton the
++ * boot tasks expect -- /private/var/db, the timezone state, the mobile user's directories. launchd's tzinit
++ * boot task exits 2 without them and launchd then panics on purpose. This is the beginning of the EVB10 cure
++ * (copy the OS volume's /private/var into the data volume once); for now it creates the directories the first
++ * boot tasks ask for, which is enough to see whether the tree or something else is what tzinit wants.
++ */
++static int
++opi5plus_mkdir(proc_t p, user_addr_t scratch, const char *path, int mode, uid_t uid, gid_t gid)
++{
++	struct mkdir_args request = {.path = scratch, .mode = mode};
++	struct opi5plus_seed_attrs attrs = {.mode = (mode_t)mode, .uid = uid, .gid = gid};
++	vnode_t vp = NULLVP;
++	int32_t result = 0;
++	int error = copyout(path, request.path, strlen(path) + 1);
++	vfs_context_t ctx = vfs_context_kernel();
++
++	if (error != 0) {
++		return error;
++	}
++	error = mkdir(p, &request, &result);
++	/*
++	 * EEXIST carries on instead of returning: the directory is there from an earlier boot of the persistent
++	 * Data volume, and its owner still has to be set. This is the round 1 failure -- ensure_dirs found
++	 * /private/var/mobile/tmp present, returned, and left it root's, so mobile (501) could not mkdir in it.
++	 */
++	if (error != 0 && error != EEXIST) {
++		return error;
++	}
++	error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx);
++	if (error != 0) {
++		return error;
++	}
++	error = opi5plus_seed_attrs_set(vp, ctx, &attrs, 0);
++	vnode_put(vp);
++	return error;
++}
++
++static void
++opi5plus_ensure_dirs(proc_t p, user_addr_t scratch)
++{
++	/*
++	 * The owner is part of the entry, not a constant: /private/var/mobile and the three directories under it
++	 * belong to mobile (501), everything else to root. A directory created with the right mode but the wrong
++	 * owner is unusable to the daemons that run as mobile, which is what round 1 shipped.
++	 */
++	static const struct {
++		const char *path;
++		int mode;
++		uid_t uid;
++		gid_t gid;
++	} dirs[] = {
++		{ "/private/var/db", 0755, 0, 0 },
++		{ "/private/var/db/timezone", 0755, 0, 0 },
++		{ "/private/var/db/diagnostics", 0755, 0, 0 },
++		{ "/private/var/db/uuidtext", 0755, 0, 0 },
++		{ "/private/var/mobile", 0755, 501, 501 },
++		{ "/private/var/mobile/tmp", 0755, 501, 501 },
++		{ "/private/var/mobile/Library", 0755, 501, 501 },
++		{ "/private/var/vm", 0755, 0, 0 },
++		{ "/private/var/tmp", 01777, 0, 0 },
++		{ "/private/var/keybags", 0755, 0, 0 },
++		{ "/private/var/preferences", 0755, 0, 0 },
++		{ "/private/var/root", 0700, 0, 0 },
++		{ "/private/var/run", 0755, 0, 0 },
++		{ "/private/var/log", 0755, 0, 0 },
++		{ "/private/var/protected", 0755, 0, 0 },
++		/* The container tree the first-boot daemons put their state in. mobileactivationd creates
++		 * Library/ucrt inside its own system group container before it answers any XPC request, and a
++		 * missing parent is reported as "Failed to create %@"; the chain is listed one level at a time
++		 * because opi5plus_mkdir makes exactly one directory per call. Directories only: the files
++		 * Apple's activation server delivers (hardware/dcrt, hardware/sdcrt, hardware/fcrt.pem,
++		 * hardware/factory/mfi, mobile/Library/mad/data_ark.plist) are never written here. */
++		{ "/private/var/containers", 0755, 0, 0 },
++		{ "/private/var/containers/Shared", 0755, 0, 0 },
++		{ "/private/var/containers/Shared/SystemGroup", 0755, 0, 0 },
++		{ "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobileactivationd", 0755, 0, 0 },
++		{ "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobileactivationd/Library", 0755, 0, 0 },
++		{ "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobileactivationd/Library/ucrt", 0755, 0, 0 },
++		{ "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobileactivationd/Library/dcrt", 0755, 0, 0 },
++		{ "/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobileactivationd/Library/internal", 0755, 0, 0 },
++		{ "/private/var/containers/Data", 0755, 0, 0 },
++		{ "/private/var/containers/Data/System", 0755, 0, 0 },
++		{ "/private/var/hardware", 0755, 0, 0 },
++		{ "/private/var/hardware/MobileActivation", 0755, 0, 0 },
++		{ "/private/var/hardware/dcrt", 0755, 0, 0 },
++		{ "/private/var/hardware/sdcrt", 0755, 0, 0 },
++		{ "/private/var/hardware/factory", 0755, 0, 0 },
++		{ "/private/var/mobile/Library/mad", 0755, 501, 501 },
++		/* Written by cfprefsd as mobile; the Data seed's preference table already gives it 501:501, so the
++		 * skeleton keeps it that way on every boot instead of only on the first. */
++		{ "/private/var/mobile/Library/Preferences", 0755, 501, 501 },
++	};
++
++	for (unsigned i = 0; i < sizeof(dirs) / sizeof(dirs[0]); ++i) {
++		const int error = opi5plus_mkdir(p, scratch, dirs[i].path, dirs[i].mode, dirs[i].uid,
++		    dirs[i].gid);
++
++		printf("opi5plus: mkdir %s -> %d 0%o %u:%u\n", dirs[i].path, error, dirs[i].mode, dirs[i].uid,
++		    dirs[i].gid);
++	}
++}
++
++/*
++ * The first-boot seed of the Data volume.
++ *
++ * The Data volume of this port is an empty APFS container, while the OS volume carries the
++ * /private/var tree a first boot expects and the preference plists that skip the Setup assistant.
++ * UniXNU-evb10 does exactly this for its own Data volume (evb10-userland-mounts.patch,
++ * evb10_data_copy and evb10_seed_prefs_write), and its board reaches SpringBoard with it; without
++ * the plists the board is put to sleep ~30 s after SpringBoard starts (IOPMrootDomain ->
++ * IOCPUSleepKernel -> ArmCpu::haltCPU), which is the state this port stops in after "swap ok".
++ *
++ * The tree is copied from the directory the Data mount covers (mount->mnt_vnodecovered, the OS
++ * volume's /private/var): directories, regular files through the OS volume's decmpfs and symbolic
++ * links, with the mode and the owner of the source. The walk is iterative because APFS operations
++ * need much of the kernel stack, and staged_system_apps is left out, as in the official seed.
++ *
++ * sd-data-seed=0 turns it off. /private/var/.opi5plus-seeded, written on a persistent Data volume
++ * only after a boot copied the tree without a single failure, makes the next boot skip the copy; on
++ * the RAM Data volume (sd-data-ram=1) the marker cannot survive a reset, so every boot seeds again.
++ */
++#define OPI5PLUS_SEED_MARKER "/private/var/.opi5plus-seeded"
++#define OPI5PLUS_SEED_CHUNK (512 * 1024)
++#define OPI5PLUS_SEED_ENTRIES 8192
++#define OPI5PLUS_SEED_POOL (1024 * 1024)
++#define OPI5PLUS_SEED_DIRS 8192
++/* Scratch page offsets: the mount arguments end below 0x400 (opi5plus_apfs_mount), a path is a
++ * MAXPATHLEN each, and the page is 4 KiB. */
++#define OPI5PLUS_SEED_PATH (0x400)
++#define OPI5PLUS_SEED_LINK (0x800)
++#define OPI5PLUS_SEED_UNLINK (0xc00)
++
++struct opi5plus_seed {
++	proc_t p;
++	user_addr_t scratch;
++	vfs_context_t ctx;
++	vnode_t root;              /* the OS volume's /private/var, iocount held by the caller */
++	size_t base;               /* strlen("/private/var") */
++	uint8_t *chunk;            /* one file's worth of bytes */
++	uint8_t *entries;          /* one directory read */
++	char *pool;                /* directories still to copy, relative to root */
++	uint32_t *at;
++	uint32_t used;
++	uint32_t count;
++	uint64_t bytes;
++	int dirs;
++	int files;
++	int links;
++	int other;
++	int skipped;
++	int failed;
++	int error;
++};
++
++static void
++opi5plus_seed_fail(struct opi5plus_seed *seed, const char *path, const char *what, int error)
++{
++	seed->failed++;
++	seed->error = error;
++	if (seed->failed <= 40) {
++		printf("opi5plus: seed: %s %s failed: %d\n", what, path, error);
++	}
++}
++
++static void
++opi5plus_seed_attrs_of(vnode_t vp, vfs_context_t ctx, struct opi5plus_seed_attrs *attrs, mode_t fallback)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_WANTED(&va, va_mode);
++	VATTR_WANTED(&va, va_uid);
++	VATTR_WANTED(&va, va_gid);
++	attrs->mode = fallback;
++	attrs->uid = 0;
++	attrs->gid = 0;
++	if (vnode_getattr(vp, &va, ctx) == 0) {
++		if (VATTR_IS_SUPPORTED(&va, va_mode)) {
++			attrs->mode = va.va_mode & 07777;
++		}
++		if (VATTR_IS_SUPPORTED(&va, va_uid)) {
++			attrs->uid = va.va_uid;
++		}
++		if (VATTR_IS_SUPPORTED(&va, va_gid)) {
++			attrs->gid = va.va_gid;
++		}
++	}
++}
++
++static int
++opi5plus_seed_attrs_set(vnode_t vp, vfs_context_t ctx, const struct opi5plus_seed_attrs *attrs, int link)
++{
++	struct vnode_attr va;
++
++	VATTR_INIT(&va);
++	VATTR_SET(&va, va_uid, attrs->uid);
++	VATTR_SET(&va, va_gid, attrs->gid);
++	if (!link) {
++		VATTR_SET(&va, va_mode, attrs->mode);
++	}
++	return vnode_setattr(vp, &va, ctx);
++}
++
++static int
++opi5plus_seed_mkdir(struct opi5plus_seed *seed, const char *path, const struct opi5plus_seed_attrs *attrs)
++{
++	struct mkdir_args request = {.path = seed->scratch + OPI5PLUS_SEED_PATH, .mode = 0755};
++	int32_t result = 0;
++	vnode_t vp = NULLVP;
++	int error = copyout(path, request.path, strlen(path) + 1);
++
++	if (error == 0) {
++		error = mkdir(seed->p, &request, &result);
++	}
++	if (error != 0 && error != EEXIST) {
++		return error;
++	}
++	error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, seed->ctx);
++	if (error == 0) {
++		error = opi5plus_seed_attrs_set(vp, seed->ctx, attrs, 0);
++		vnode_put(vp);
++	}
++	return error;
++}
++
++static int
++opi5plus_seed_ensure_dir(struct opi5plus_seed *seed, const char *path, mode_t mode, uid_t uid, gid_t gid)
++{
++	struct opi5plus_seed_attrs attrs = {.mode = mode, .uid = uid, .gid = gid};
++	vnode_t vp = NULLVP;
++	int error = opi5plus_seed_mkdir(seed, path, &attrs);
++
++	/*
++	 * The owner is set whether this call made the directory or found it: a directory that already exists is
++	 * exactly the case that has to be repaired, and the early return that used to be here is why the first
++	 * seed of a persistent Data volume left /private/var/mobile/tmp to root.
++	 */
++	if (error != 0) {
++		return error;
++	}
++	error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, seed->ctx);
++	if (error == 0) {
++		error = opi5plus_seed_attrs_set(vp, seed->ctx, &attrs, 0);
++		vnode_put(vp);
++	}
++	return error;
++}
++
++/* A file of exactly these bytes (O_TRUNC), with this owner and mode, and on the medium before it returns. */
++static int
++opi5plus_seed_write(struct opi5plus_seed *seed, const char *path, const void *data, size_t size, mode_t mode,
++    uid_t uid, gid_t gid)
++{
++	vfs_context_t ctx = seed->ctx;
++	vnode_t vp = NULLVP;
++	off_t done = 0;
++	int error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, mode, 0, &vp, ctx);
++
++	if (error != 0) {
++		return error;
++	}
++	while (error == 0 && (size_t)done < size) {
++		size_t piece = size - (size_t)done;
++		int resid = 0;
++
++		if (piece > (size_t)(1024 * 1024)) {
++			piece = 1024 * 1024;
++		}
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)((uintptr_t)data + (uintptr_t)done), (int)piece, done,
++		    UIO_SYSSPACE, IO_NOAUTH | IO_UNIT, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (error == 0 && resid != 0) {
++			error = EIO;
++		}
++		done += (off_t)piece;
++	}
++	if (error == 0) {
++		struct opi5plus_seed_attrs attrs = {.mode = mode, .uid = uid, .gid = gid};
++		error = opi5plus_seed_attrs_set(vp, ctx, &attrs, 0);
++	}
++	if (error == 0) {
++		error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++	}
++	{
++		int close_error = vnode_close(vp, FWRITE, ctx);
++		if (error == 0) {
++			error = close_error;
++		}
++	}
++	return error;
++}
++
++/* Reads to the end of the source rather than trusting its size: most of these files are compressed on
++ * the OS volume. */
++static int
++opi5plus_seed_copy_file(struct opi5plus_seed *seed, vnode_t source, const char *path,
++    const struct opi5plus_seed_attrs *attrs)
++{
++	vfs_context_t ctx = seed->ctx;
++	vnode_t vp = NULLVP;
++	off_t at = 0;
++	int error = VNOP_OPEN(source, FREAD, ctx);
++
++	if (error != 0) {
++		return error;
++	}
++	error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, attrs->mode & 0777, 0, &vp, ctx);
++	while (error == 0) {
++		int resid = 0;
++		int length;
++
++		error = vn_rdwr(UIO_READ, source, (caddr_t)seed->chunk, OPI5PLUS_SEED_CHUNK, at, UIO_SYSSPACE,
++		    IO_NOAUTH, vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		length = OPI5PLUS_SEED_CHUNK - resid;
++		if (error != 0 || length <= 0) {
++			break;
++		}
++		error = vn_rdwr(UIO_WRITE, vp, (caddr_t)seed->chunk, length, at, UIO_SYSSPACE, IO_NOAUTH | IO_UNIT,
++		    vfs_context_ucred(ctx), &resid, vfs_context_proc(ctx));
++		if (error == 0 && resid != 0) {
++			error = EIO;
++		}
++		at += length;
++		seed->bytes += (uint64_t)length;
++	}
++	if (vp != NULLVP) {
++		if (error == 0) {
++			error = opi5plus_seed_attrs_set(vp, ctx, attrs, 0);
++		}
++		/* Each file reaches the medium before the next one: without this the copy piles up dirty pages
++		 * until it stalls. */
++		if (error == 0) {
++			error = VNOP_FSYNC(vp, MNT_WAIT, ctx);
++		}
++		{
++			int close_error = vnode_close(vp, FWRITE, ctx);
++			if (error == 0) {
++				error = close_error;
++			}
++		}
++	}
++	VNOP_CLOSE(source, FREAD, ctx);
++	return error;
++}
++
++static int
++opi5plus_seed_copy_link(struct opi5plus_seed *seed, vnode_t source, const char *path,
++    const struct opi5plus_seed_attrs *attrs)
++{
++	/* syscalls.master declares symlink(char *path, char *link): path is the target text, link the new name.
++	 * The stub takes both as user addresses (generated sysproto.h: user_addr_t), so they are handed over as
++	 * the addresses they already are. */
++	const user_addr_t target_addr = seed->scratch + OPI5PLUS_SEED_PATH;
++	const user_addr_t link_addr = seed->scratch + OPI5PLUS_SEED_LINK;
++	struct symlink_args request = {.path = target_addr, .link = link_addr};
++	char *target = (char *)seed->chunk;
++	int32_t result = 0;
++	vnode_t vp = NULLVP;
++	uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_READ);
++	size_t length;
++	int error;
++
++	if (uio == NULL) {
++		return ENOMEM;
++	}
++	uio_addiov(uio, CAST_USER_ADDR_T(target), MAXPATHLEN - 1);
++	error = VNOP_READLINK(source, uio, seed->ctx);
++	length = (size_t)(MAXPATHLEN - 1) - (size_t)uio_resid(uio);
++	uio_free(uio);
++	if (error != 0) {
++		return error;
++	}
++	if (length == 0 || length >= (size_t)(MAXPATHLEN - 1)) {
++		return EIO;
++	}
++	target[length] = '\0';
++	if ((error = copyout(target, target_addr, length + 1)) != 0 ||
++	    (error = copyout(path, link_addr, strlen(path) + 1)) != 0) {
++		return error;
++	}
++	error = symlink(seed->p, &request, &result);
++	if (error != 0 && error != EEXIST) {
++		return error;
++	}
++	error = vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, seed->ctx);
++	if (error == 0) {
++		error = opi5plus_seed_attrs_set(vp, seed->ctx, attrs, 1);
++		vnode_put(vp);
++	}
++	return error;
++}
++
++/*
++ * Copies the entries of DIR into the seed's PATH (appending each name to PATH and cutting it off
++ * again) and queues its subdirectories, whose source-relative paths start at REL inside PATH.
++ */
++static void
++opi5plus_seed_copy_dir(struct opi5plus_seed *seed, vnode_t dir, char *path, size_t path_size, size_t rel)
++{
++	vfs_context_t ctx = seed->ctx;
++	size_t base = strlen(path);
++	off_t offset = 0;
++	int eof = 0;
++	int error = VNOP_OPEN(dir, FREAD, ctx);
++
++	if (error != 0) {
++		opi5plus_seed_fail(seed, path, "open of", error);
++		return;
++	}
++	while (error == 0 && !eof) {
++		uio_t uio = uio_create(1, offset, UIO_SYSSPACE, UIO_READ);
++		int count = 0;
++		uint32_t filled;
++
++		if (uio == NULL) {
++			error = ENOMEM;
++			break;
++		}
++		uio_addiov(uio, CAST_USER_ADDR_T(seed->entries), OPI5PLUS_SEED_ENTRIES);
++		error = vnode_readdir64(dir, uio, VNODE_READDIR_EXTENDED, &eof, &count, ctx);
++		filled = (uint32_t)(OPI5PLUS_SEED_ENTRIES - (uint32_t)uio_resid(uio));
++		offset = uio_offset(uio);
++		uio_free(uio);
++		if (error != 0 || filled == 0) {
++			break;
++		}
++		for (uint32_t at = 0; at + offsetof(struct direntry, d_name) < filled;) {
++			struct direntry *entry = (struct direntry *)(seed->entries + at);
++			const char *name;
++			vnode_t child = NULLVP;
++			int child_error;
++
++			if (entry->d_reclen == 0 || at + entry->d_reclen > filled) {
++				error = EINVAL;
++				break;
++			}
++			at += entry->d_reclen;
++			name = entry->d_name;
++			if (entry->d_ino == 0 || !strcmp(name, ".") || !strcmp(name, "..")) {
++				continue;
++			}
++			/* The official seed leaves the staged system apps out (tens of megabytes). */
++			if (base == seed->base && !strcmp(name, "staged_system_apps")) {
++				seed->skipped++;
++				continue;
++			}
++			if (base + 1 + strlen(name) >= path_size) {
++				opi5plus_seed_fail(seed, name, "name too long:", ENAMETOOLONG);
++				continue;
++			}
++			path[base] = '/';
++			strlcpy(path + base + 1, name, path_size - base - 1);
++			child_error = vnode_lookupat(name, VNODE_LOOKUP_NOFOLLOW | VNODE_LOOKUP_NOCROSSMOUNT, &child,
++			    ctx, dir);
++			if (child_error == 0) {
++				struct opi5plus_seed_attrs attrs;
++				enum vtype type = vnode_vtype(child);
++
++				opi5plus_seed_attrs_of(child, ctx, &attrs, type == VDIR ? 0755 : 0644);
++				if (type == VDIR) {
++					size_t length;
++					child_error = opi5plus_seed_mkdir(seed, path, &attrs);
++					length = strlen(path + rel) + 1;
++					if (child_error == 0 &&
++					    (seed->count == OPI5PLUS_SEED_DIRS || OPI5PLUS_SEED_POOL - seed->used < length)) {
++						child_error = ENOSPC;
++					}
++					if (child_error == 0) {
++						memcpy(seed->pool + seed->used, path + rel, length);
++						seed->at[seed->count++] = seed->used;
++						seed->used += (uint32_t)length;
++						seed->dirs++;
++					}
++				} else if (type == VREG) {
++					child_error = opi5plus_seed_copy_file(seed, child, path, &attrs);
++					if (child_error == 0) {
++						seed->files++;
++					}
++				} else if (type == VLNK) {
++					child_error = opi5plus_seed_copy_link(seed, child, path, &attrs);
++					if (child_error == 0) {
++						seed->links++;
++					}
++				} else {
++					seed->other++;
++					printf("opi5plus: seed: %s is neither a directory, a file nor a link (type %d), left out\n",
++					    path, (int)type);
++				}
++				vnode_put(child);
++			}
++			if (child_error != 0) {
++				opi5plus_seed_fail(seed, path, "copy of", child_error);
++			}
++			path[base] = '\0';
++		}
++	}
++	if (error != 0) {
++		opi5plus_seed_fail(seed, path, "reading", error);
++	}
++	VNOP_CLOSE(dir, FREAD, ctx);
++}
++
++/* Copies the tree below seed->root into the Data directory PATH, which exists. */
++static void
++opi5plus_seed_walk(struct opi5plus_seed *seed, char *path, size_t path_size)
++{
++	size_t root = strlen(path);
++
++	opi5plus_seed_copy_dir(seed, seed->root, path, path_size, root + 1);
++	while (seed->count != 0) {
++		const char *rel = seed->pool + seed->at[--seed->count];
++		vnode_t dir = NULLVP;
++		int error;
++
++		if (root + 1 + strlen(rel) >= path_size) {
++			opi5plus_seed_fail(seed, rel, "name too long:", ENAMETOOLONG);
++			continue;
++		}
++		path[root] = '/';
++		strlcpy(path + root + 1, rel, path_size - root - 1);
++		error = vnode_lookupat(rel, VNODE_LOOKUP_NOFOLLOW | VNODE_LOOKUP_NOCROSSMOUNT, &dir, seed->ctx,
++		    seed->root);
++		if (error == 0) {
++			opi5plus_seed_copy_dir(seed, dir, path, path_size, root + 1);
++			vnode_put(dir);
++		} else {
++			opi5plus_seed_fail(seed, path, "lookup of", error);
++		}
++		path[root] = '\0';
++	}
++}
++
++/*
++ * The preference plists that skip the Setup assistant and keep the display on, byte for byte the ones
++ * UniXNU's scripts/seed-data-skip-setup.py (--no-auto-dim) writes into a Data seed on macOS, and the
++ * ones evb10-userland-mounts.patch writes from the kernel (evb10_seed_prefs[]). XML property lists:
++ * CFPreferences reads both forms. evb10-seed-prefs=0 turns it off there, sd-data-seed=0 here.
++ */
++#define OPI5PLUS_PL_HEAD "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" \
++	"<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" \
++	"<plist version=\"1.0\">\n<dict>\n"
++#define OPI5PLUS_PL_TAIL "</dict>\n</plist>\n"
++#define OPI5PLUS_PL_TRUE(k) "\t<key>" k "</key>\n\t<true/>\n"
++#define OPI5PLUS_PL_FALSE(k) "\t<key>" k "</key>\n\t<false/>\n"
++
++static const struct {
++	const char *name;
++	const char *body;
++} opi5plus_seed_prefs[] = {
++	{"com.apple.purplebuddy",
++	 OPI5PLUS_PL_HEAD OPI5PLUS_PL_TRUE("SetupDone") OPI5PLUS_PL_TRUE("SetupFinishedAllSteps")
++	 "\t<key>SetupVersion</key>\n\t<integer>11</integer>\n" OPI5PLUS_PL_FALSE("daemonizeNeedsToRun") OPI5PLUS_PL_TAIL},
++	{"com.apple.purplebuddy.notbackedup",
++	 OPI5PLUS_PL_HEAD OPI5PLUS_PL_FALSE("ShouldRunDiagnosticsMiniBuddy") OPI5PLUS_PL_FALSE("ShouldRunHSA2MiniBuddy")
++	 OPI5PLUS_PL_FALSE("ShouldRunKeychainSyncMiniBuddy") OPI5PLUS_PL_FALSE("ShouldRunMesaMiniBuddy")
++	 OPI5PLUS_PL_FALSE("ShouldRunPaymentMiniBuddy") OPI5PLUS_PL_FALSE("ShouldRunStandardMiniBuddy")
++	 OPI5PLUS_PL_FALSE("SilentICDPUpgrade") OPI5PLUS_PL_TAIL},
++	{"com.apple.managedconfiguration.notbackedup",
++	 OPI5PLUS_PL_HEAD OPI5PLUS_PL_FALSE("LockdownActivationIndicatesCloudConfigurationAvailable") OPI5PLUS_PL_TAIL},
++	{"com.apple.springboard",
++	 OPI5PLUS_PL_HEAD OPI5PLUS_PL_TRUE("BKNoWatchdogs")
++	 "\t<key>FBLaunchWatchdogExceptions</key>\n\t<dict>\n\t\t<key>com.apple.purplebuddy</key>\n\t\t<real>100</real>\n\t</dict>\n"
++	 OPI5PLUS_PL_FALSE("MCForceShowCloudConfigurationUI")
++	 OPI5PLUS_PL_TRUE("SBDisableAutoDim") OPI5PLUS_PL_TRUE("SBDontDimOrLockOnAC") OPI5PLUS_PL_TRUE("SBDisableIdleSleep")
++	 OPI5PLUS_PL_TAIL},
++	{"com.apple.migration",
++	 OPI5PLUS_PL_HEAD "\t<key>LastSystemVersion</key>\n\t<string>21H461</string>\n"
++	 "\t<key>DMUserDataDisposition</key>\n\t<dict>\n\t\t<key>SyntheticDidUpgrade</key>\n\t\t<false/>\n"
++	 "\t\t<key>buildVersion</key>\n\t\t<string>21H461</string>\n\t</dict>\n" OPI5PLUS_PL_TAIL},
++};
++
++static void
++opi5plus_seed_prefs_write(struct opi5plus_seed *seed)
++{
++	static const struct {
++		const char *path;
++		mode_t mode;
++		uid_t uid;
++		gid_t gid;
++	} dirs[] = {
++		{"/private/var/mobile/Library", 0755, 501, 501},
++		{"/private/var/mobile/Library/Preferences", 0755, 501, 501},
++		/* On a device these live on the data volume (UniXNU's seed tool and ios-sweet's root tweaks make them too). */
++		{"/private/var/containers", 0755, 0, 0},
++		{"/private/var/containers/Bundle", 0755, 0, 0},
++		{"/private/var/containers/Data", 0755, 0, 0},
++		{"/private/var/containers/Data/System", 0755, 0, 0},
++		{"/private/var/containers/Shared", 0755, 0, 0},
++		{"/private/var/containers/Shared/SystemGroup", 0755, 0, 0},
++		{"/private/var/containers/Temp", 0755, 0, 0},
++	};
++	char *path = kalloc_data(MAXPATHLEN, Z_WAITOK);
++
++	for (unsigned i = 0; i < sizeof(dirs) / sizeof(dirs[0]); ++i) {
++		const int error = opi5plus_seed_ensure_dir(seed, dirs[i].path, dirs[i].mode, dirs[i].uid, dirs[i].gid);
++
++		if (error != 0) {
++			opi5plus_seed_fail(seed, dirs[i].path, "creating", error);
++		}
++	}
++	if (path == NULL) {
++		opi5plus_seed_fail(seed, "preferences", "memory for", ENOMEM);
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(opi5plus_seed_prefs) / sizeof(opi5plus_seed_prefs[0]); ++i) {
++		int error;
++
++		snprintf(path, MAXPATHLEN, "/private/var/mobile/Library/Preferences/%s.plist", opi5plus_seed_prefs[i].name);
++		error = opi5plus_seed_write(seed, path, opi5plus_seed_prefs[i].body, strlen(opi5plus_seed_prefs[i].body), 0600,
++		    501, 501);
++		if (error != 0) {
++			opi5plus_seed_fail(seed, path, "writing", error);
++		}
++	}
++	kfree_data(path, MAXPATHLEN);
++	printf("opi5plus: seed: wrote %d preference files (Setup skipped, auto dim and idle sleep off)\n",
++	    (int)(sizeof(opi5plus_seed_prefs) / sizeof(opi5plus_seed_prefs[0])));
++}
++
++/* Written on a persistent Data volume after the first complete copy; present = the tree is there. */
++static int
++opi5plus_seed_marker_present(vfs_context_t ctx)
++{
++	vnode_t vp = NULLVP;
++
++	if (vnode_lookup(OPI5PLUS_SEED_MARKER, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) != 0) {
++		return 0;
++	}
++	vnode_put(vp);
++	return 1;
++}
++
++/*
++ * The seed itself, called once the Data volume is mounted on /private/var: copy the OS volume's
++ * /private/var tree in, make the directories the first boot writes into, write the five preference
++ * plists, and mark a persistent volume as seeded.
++ */
++static void
++opi5plus_seed_tree(proc_t p, user_addr_t scratch, mount_t data_mount)
++{
++	struct opi5plus_seed seed = {.p = p, .scratch = scratch, .ctx = vfs_context_kernel(),
++	    .base = sizeof("/private/var") - 1};
++	uint32_t persist = 0;
++	int persistent;
++	vnode_t covered;
++	char *path;
++	int error;
++
++	(void) PE_parse_boot_argn("sd-data-persist", &persist, sizeof(persist));
++	/*
++	 * package/NativeSd formats a window at the end of userdata when sd-data-persist=1 and publishes the
++	 * payload's Data seed as a RAM block device only if that failed, which is also why the payload script
++	 * passes both. The marker is worth reading only on the card window, so sd-data-persist is what says
++	 * whether to look for it; a RAM volume is empty again after every reset, so a marker written there
++	 * (the format failed) cannot make the next boot skip the copy.
++	 */
++	persistent = (persist != 0);
++	if (persistent && opi5plus_seed_marker_present(seed.ctx)) {
++		printf("opi5plus: seed: persistent Data volume, seeded by an earlier boot (%s exists): nothing copied\n",
++		    OPI5PLUS_SEED_MARKER);
++		return;
++	}
++	covered = data_mount->mnt_vnodecovered;
++	error = (covered != NULLVP) ? vnode_getwithref(covered) : ENOENT;
++	path = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	seed.chunk = kalloc_data(OPI5PLUS_SEED_CHUNK, Z_WAITOK);
++	seed.entries = kalloc_data(OPI5PLUS_SEED_ENTRIES, Z_WAITOK);
++	seed.pool = kalloc_data(OPI5PLUS_SEED_POOL, Z_WAITOK);
++	seed.at = kalloc_data(OPI5PLUS_SEED_DIRS * sizeof(uint32_t), Z_WAITOK);
++	if (error != 0) {
++		printf("opi5plus: seed: the OS volume's /private/var under the mount is not reachable: %d\n", error);
++		opi5plus_seed_fail(&seed, "/private/var", "the OS volume's", error);
++	} else if (path == NULL || seed.chunk == NULL || seed.entries == NULL || seed.pool == NULL || seed.at == NULL) {
++		printf("opi5plus: seed: out of memory for the copy\n");
++		opi5plus_seed_fail(&seed, "/private/var", "memory for", ENOMEM);
++	} else {
++		/* The runtime directories of the official seed: the OS tree does not have them. */
++		static const struct {
++			const char *path;
++			mode_t mode;
++			uid_t uid;
++			gid_t gid;
++		} runtime[] = {
++			{"/private/var/keybags", 0755, 0, 0},
++			{"/private/var/mobile", 0755, 501, 501},
++			{"/private/var/mobile/tmp", 0755, 501, 501},
++			{"/private/var/tmp", 01777, 0, 0},
++			{"/private/var/run", 0755, 0, 0},
++		};
++		struct opi5plus_seed_attrs top;
++
++		seed.root = covered;
++		opi5plus_seed_attrs_of(covered, seed.ctx, &top, 0755);
++		strlcpy(path, "/private/var", MAXPATHLEN);
++		error = opi5plus_seed_mkdir(&seed, path, &top);
++		if (error != 0) {
++			opi5plus_seed_fail(&seed, path, "attributes of", error);
++		}
++		opi5plus_seed_walk(&seed, path, MAXPATHLEN);
++		for (unsigned i = 0; i < sizeof(runtime) / sizeof(runtime[0]); ++i) {
++			error = opi5plus_seed_ensure_dir(&seed, runtime[i].path, runtime[i].mode, runtime[i].uid,
++			    runtime[i].gid);
++			if (error != 0) {
++				opi5plus_seed_fail(&seed, runtime[i].path, "creating", error);
++			}
++		}
++		opi5plus_seed_prefs_write(&seed);
++	}
++	if (error == 0 && covered != NULLVP) {
++		vnode_put(covered);
++	}
++	if (path != NULL) {
++		kfree_data(path, MAXPATHLEN);
++	}
++	if (seed.chunk != NULL) {
++		kfree_data(seed.chunk, OPI5PLUS_SEED_CHUNK);
++	}
++	if (seed.entries != NULL) {
++		kfree_data(seed.entries, OPI5PLUS_SEED_ENTRIES);
++	}
++	if (seed.pool != NULL) {
++		kfree_data(seed.pool, OPI5PLUS_SEED_POOL);
++	}
++	if (seed.at != NULL) {
++		kfree_data(seed.at, OPI5PLUS_SEED_DIRS * sizeof(uint32_t));
++	}
++	printf("opi5plus: seed: tree copied: %d directories, %d files (%d KiB), %d links, %d left out, %d skipped, %d failures (last error %d)\n",
++	    seed.dirs, seed.files, (int)(seed.bytes >> 10), seed.links, seed.other, seed.skipped, seed.failed, seed.error);
++	if (!persistent) {
++		printf("opi5plus: seed: RAM Data volume, no marker: the next boot seeds again\n");
++	} else if (seed.failed != 0) {
++		printf("opi5plus: seed: %d failures: the volume is not marked as seeded, the next boot copies again\n",
++		    seed.failed);
++	} else {
++		static const char marker_text[] = "seeded by 0002-mount-data-volume\n";
++
++		/* Everything above is on the card before the marker says so. */
++		error = VFS_SYNC(data_mount, MNT_WAIT, seed.ctx);
++		if (error == 0) {
++			error = opi5plus_seed_write(&seed, OPI5PLUS_SEED_MARKER, marker_text, sizeof(marker_text) - 1,
++			    0644, 0, 0);
++		}
++		if (error == 0) {
++			error = VFS_SYNC(data_mount, MNT_WAIT, seed.ctx);
++		}
++		printf("opi5plus: seed: persistent volume marked as seeded (%s): %d\n", OPI5PLUS_SEED_MARKER, error);
++	}
++}
++
++/*
++ * MobileGestalt's caches, dropped on every boot, as UniXNU-evb10 does after its own Data mount
++ * verification (evb10-userland-mounts.patch).
++ *
++ * A Data volume that first saw the display without unit-scale cached MainScreenScale=0 in
++ * MobileGestalt. SpringBoard then builds FBSDisplayMode with preferredScale=0 (sb14: mode 1072x1904
++ * scale 0) even though /chosen display-scale is 2, and no frame reaches the display. Dropping the
++ * caches makes MobileGestalt read /chosen and the ADT again; the files are rewritten on the next
++ * query. This is not part of the marker: it is the same three paths on every boot.
++ */
++static void
++opi5plus_wipe_mobilegestalt(proc_t p, user_addr_t scratch)
++{
++	static const char *const caches[] = {
++		"/private/var/containers/Shared/SystemGroup/systemgroup.com.apple.mobilegestaltcache/Library/Caches/com.apple.MobileGestalt.plist",
++		"/private/var/mobile/Library/Preferences/com.apple.MobileGestalt.plist",
++		"/private/var/mobile/Library/Preferences/com.apple.mobilegestalt.plist",
++	};
++
++	for (unsigned i = 0; i < sizeof(caches) / sizeof(caches[0]); ++i) {
++		struct unlink_args request = {.path = scratch + OPI5PLUS_SEED_UNLINK};
++		int32_t result = 0;
++		int error = copyout(caches[i], request.path, strlen(caches[i]) + 1);
++
++		if (error == 0) {
++			error = unlink(p, &request, &result);
++		}
++		printf("opi5plus: MG cache wiped %s -> %d\n", caches[i], error);
++	}
++}
++
++__attribute__((weak)) int
++native_emmc_root_trusted(int32_t dev)
++{
++	(void)dev;
++	return 0;
++}
++
++/*
++ * The bootstrap pass of the XNU build links without the display archive, so the probe entry points that
++ * UniXNU's offline-component-load-probes.patch calls (bsd_init and IOUserClient) have nothing behind them
++ * there. These weak definitions keep that pass linkable; with CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y the real
++ * link force-loads libNativeLegacyDisplay.late.a and the archive's strong definitions replace them.
++ */
++__attribute__((weak)) void
++native_legacy_display_probe(void)
++{
++}
++
++__attribute__((weak)) void
++native_legacy_display_late_probe(void)
++{
++}
++
++/*
++ * How far the display probe got, printed by the heartbeat below. The probe cannot write the UART itself: the
++ * kernel console owns it, and two writers at 1.5 Mbaud truncate each other's lines (evidence/m5/M5-04). One
++ * writer, the heartbeat, prints the stage the probe has reached. Zero and "none" mean the probe never ran.
++ */
++__attribute__((weak)) unsigned
++opi5plus_probe_stage(void)
++{
++	return 0;
++}
++
++__attribute__((weak)) const char *
++opi5plus_probe_stage_name(void)
++{
++	return "none";
++}
++
++static int
++opi5plus_apfs_mount(proc_t p, user_addr_t scratch, const char *path, const char *device_path, int flags)
++{
++	uint8_t mount_data[0x150] = {0};
++	user_addr_t spec = scratch + 0x160;
++	uint64_t apfs_flags = (flags & MNT_RDONLY) ? MNT_RDONLY : 0;
++	uint16_t mount_mode = 1;
++	uint32_t anonymous_owner = 99;
++	struct mount_args request = {.type = scratch + 0x100, .path = scratch + 0x120, .flags = flags,
++	    .data = scratch + 0x200};
++	int32_t result = 0;
++	int error;
++
++	memcpy(mount_data, &spec, sizeof(spec));
++	memcpy(mount_data + 8, &apfs_flags, sizeof(apfs_flags));
++	memcpy(mount_data + 16, &mount_mode, sizeof(mount_mode));
++	memcpy(mount_data + 0x144, &anonymous_owner, sizeof(anonymous_owner));
++	memcpy(mount_data + 0x148, &anonymous_owner, sizeof(anonymous_owner));
++	if ((error = copyout("apfs", request.type, 5)) != 0 ||
++	    (error = copyout(path, request.path, strlen(path) + 1)) != 0 ||
++	    (error = copyout(device_path, spec, strlen(device_path) + 1)) != 0 ||
++	    (error = copyout(mount_data, request.data, sizeof(mount_data))) != 0) {
++		return error;
++	}
++	return mount(p, &request, &result);
++}
++
++/* The mount opi5plus_userland_prepare put on /private/var, kept for the beat line's free-block count: the
++ * mount lives as long as the system does, so the pointer is read back under vfs_isunmount() rather than
++ * dereferenced blindly. */
++static mount_t opi5plus_data_mount;
++
++/*
++ * Owner, group and mode of the paths the userland has to write, once the seed is done: a boot that fails in
++ * its first seconds then says which directory came out wrong instead of only that something could not create
++ * a file. vnode_getattr() is the KPI here (struct vnode_attr, not the older struct vattr), and it is asked
++ * only for the three fields printed.
++ */
++static void
++opi5plus_report_perms(void)
++{
++	static const char *paths[] = {
++		"/private/var",
++		"/private/var/mobile",
++		"/private/var/mobile/Library",
++		"/private/var/mobile/tmp",
++		"/private/var/tmp",
++		"/private/var/db",
++		"/private/var/db/biome",
++		"/private/var/containers",
++	};
++	vfs_context_t ctx = vfs_context_kernel();
++
++	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
++		struct vnode_attr va;
++		vnode_t vp = NULLVP;
++		int rc = vnode_lookup(paths[i], 0, &vp, ctx);
++
++		if (rc == 0 && vp != NULLVP) {
++			VATTR_INIT(&va);
++			VATTR_WANTED(&va, va_uid);
++			VATTR_WANTED(&va, va_gid);
++			VATTR_WANTED(&va, va_mode);
++			rc = vnode_getattr(vp, &va, ctx);
++			vnode_put(vp);
++			if (rc == 0) {
++				printf("opi5plus: stat %s rc 0 uid %u gid %u mode 0%o\n", paths[i],
++				    (unsigned)va.va_uid, (unsigned)va.va_gid, (unsigned)va.va_mode);
++				continue;
++			}
++		}
++		printf("opi5plus: stat %s rc %d uid -1 gid -1 mode 0\n", paths[i], rc);
++	}
++}
++
++int
++opi5plus_userland_prepare(proc_t p, user_addr_t scratch)
++{
++	static int attempted = 0;
++	char device_path[32] = {0};
++	int32_t device = 0;
++	uint32_t union_enable = 1, data_enable = 1;
++	int error;
++
++	if (attempted) {
++		return 0;
++	}
++	attempted = 1;
++	{
++		extern void opi5plus_start_ps_thread(void);
++		opi5plus_start_ps_thread();
++	}	(void) PE_parse_boot_argn("sd-systemos-union", &union_enable, sizeof(union_enable));
++	(void) PE_parse_boot_argn("sd-data-mount", &data_enable, sizeof(data_enable));
++
++	/*
++	 * The dyld shared cache is in the SystemOS cryptex, not on the OS volume: mount that volume read-only
++	 * over "/" as the upper layer of a union so /System/Library/Caches/com.apple.dyld is where iPadOS looks
++	 * for it. dyld flag bit 3 then says the images in this mode are vouched for by the owner chain and the
++	 * read-only mount rather than by an Image4 manifest, so ignition is not run for them.
++	 */
++	if (union_enable) {
++		if (!native_sd_volume_device("8846FE78-2910-4297-AF97-D59BB6F8FC16", device_path,
++		    sizeof(device_path), &device)) {
++			printf("opi5plus: no SystemOS volume published; the dyld shared cache stays out of reach\n");
++		} else {
++			printf("opi5plus: SystemOS volume %s (device %u,%u) goes over / as a union\n", device_path,
++			    major(device), minor(device));
++			error = opi5plus_apfs_mount(p, scratch, "/", device_path, MNT_RDONLY | MNT_UNION);
++			if (error) {
++				printf("opi5plus: SystemOS union over / failed: %d\n", error);
++			} else {
++				dyld_flags |= UINT64_C(8);
++				commpage_update_dyld_flags(dyld_flags);
++				printf("opi5plus: / is a union with the SystemOS cryptex; dyld ignition disabled\n");
++			}
++		}
++	}
++
++	if (!data_enable) {
++		printf("opi5plus: sd-data-mount=0, /private/var left as it is\n");
++		return 0;
++	}
++	if (!native_sd_data_device(device_path, sizeof(device_path), &device)) {
++		printf("opi5plus: no Data volume published; /private/var stays on the OS volume\n");
++		return ENOENT;
++	}
++	printf("opi5plus: Data volume %s (device %u,%u) goes on /private/var\n", device_path, major(device),
++	    minor(device));
++	/* MNT_UNION is off by default now, and the board said why: with the union, `/private/var/mobile` comes from
++	 * the read-only OS volume underneath, and launchd's own `fixup-mobile-tmp` boot task failed on it with
++	 * "could not set create /private/var/mobile/tmp: Read-only file system". A writable but empty volume is
++	 * what the boot tasks need to make their directories in; sd-data-union=1 brings the union back. */
++	{
++		uint32_t uniondata = 0;
++		(void) PE_parse_boot_argn("sd-data-union", &uniondata, sizeof(uniondata));
++		error = opi5plus_apfs_mount(p, scratch, "/private/var", device_path,
++		    uniondata != 0 ? MNT_UNION : 0);
++		if (error == 0) {
++			printf("opi5plus: /private/var mounted%s\n", uniondata != 0 ? " as a union" : "");
++		}
++	}
++	if (error) {
++		printf("opi5plus: mounting %s on /private/var failed: %d\n", device_path, error);
++		return error;
++	}
++	printf("opi5plus: /private/var is the Data volume now\n");
++	/* Hold on to the mount: vfs_statfs() on it answers from the cached statistics. */
++	{
++		vnode_t data_root = NULLVP;
++
++		if (vnode_lookup("/private/var", 0, &data_root, vfs_context_kernel()) == 0 &&
++		    data_root != NULLVP) {
++			opi5plus_data_mount = vnode_mount(data_root);
++			vnode_put(data_root);
++		}
++	}
++	{
++		uint32_t skeleton = 1;
++		(void) PE_parse_boot_argn("sd-data-skeleton", &skeleton, sizeof(skeleton));
++		if (skeleton != 0) {
++			opi5plus_ensure_dirs(p, scratch);
++		}
++	}
++	/* Every boot, before launchd runs: the MobileGestalt caches go (opi5plus_wipe_mobilegestalt). */
++	opi5plus_wipe_mobilegestalt(p, scratch);
++	{
++		/* Then, once per volume, the first-boot seed: the OS volume's /private/var tree, the runtime
++		 * directories and the preference plists that skip the Setup assistant. sd-data-seed=0 leaves the
++		 * volume alone, which is the way back if the seed itself is what a boot trips over. */
++		uint32_t seed = 1;
++		vnode_t data_root = NULLVP;
++
++		(void) PE_parse_boot_argn("sd-data-seed", &seed, sizeof(seed));
++		if (seed == 0) {
++			printf("opi5plus: seed: sd-data-seed=0, the Data volume is left as it is\n");
++		} else if (vnode_lookup("/private/var", 0, &data_root, vfs_context_kernel()) != 0 ||
++		    data_root == NULLVP) {
++			printf("opi5plus: seed: /private/var does not resolve on the Data volume, nothing seeded\n");
++		} else {
++			opi5plus_seed_tree(p, scratch, vnode_mount(data_root));
++			vnode_put(data_root);
++		}
++	}
++	/*
++	 * Arm the RK3588 watchdog last, once the mounts are in: from here on the heartbeat thread kicks it every
++	 * five seconds, so a kernel that stops running is a reset instead of a board that has to be unplugged.
++	 */
++	{
++		uint32_t watchdog = 15;
++		(void) PE_parse_boot_argn("sd-watchdog", &watchdog, sizeof(watchdog));
++		if (watchdog != 0) {
++			if (native_sd_watchdog_start(watchdog)) {
++				printf("opi5plus: watchdog armed (timeout index %u)\n", watchdog);
++			} else {
++				/* Worth a line of its own: without it, only a panic resets this board. */
++				printf("opi5plus: watchdog NOT armed (timeout index %u)\n", watchdog);
++			}
++		}
++	}
++	opi5plus_check_paths();
++	{
++		/* What the display drivers will see: GopFramebuffer compares this console with its device memory. */
++		extern int PE_current_console(PE_Video * info);
++		PE_Video video;
++		int result = PE_current_console(&video);
++		opi5plus_pe_puts("\r\nopi5plus: console result ");
++		opi5plus_pe_number((unsigned long long)result);
++		opi5plus_pe_puts(" base ");
++		opi5plus_pe_number((unsigned long long)video.v_baseAddr);
++		opi5plus_pe_puts(" row ");
++		opi5plus_pe_number((unsigned long long)video.v_rowBytes);
++		opi5plus_pe_puts(" w ");
++		opi5plus_pe_number((unsigned long long)video.v_width);
++		opi5plus_pe_puts(" h ");
++		opi5plus_pe_number((unsigned long long)video.v_height);
++		opi5plus_pe_puts(" depth ");
++		opi5plus_pe_number((unsigned long long)video.v_depth);
++		opi5plus_pe_puts("\r\n");
++	}
++	{
++		uint32_t paint = 0;
++		(void) PE_parse_boot_argn("sd-paint", &paint, sizeof(paint));
++		if (paint != 0) {
++			opi5plus_paint_screen();
++		}
++	}
++	/* Last, after the seed: how the five paths the daemons write came out. */
++	opi5plus_report_perms();
++	return 0;
++}
++
++/*
++ * What launchd will actually see. The Data seed of this port is an empty APFS container (nothing on Linux can
++ * write into APFS), so the directories iPadOS expects under /private/var may simply not be there: this says
++ * which of them resolve, and whether the dyld shared cache is reachable through the SystemOS union.
++ */
++static void
++opi5plus_check_paths(void)
++{
++	static const char *paths[] = {
++		"/private/var/db",
++		"/private/var/vm",
++		"/private/var/mobile",
++		"/private/var/tmp",
++		"/private/var/keybags",
++		"/private/var/preferences",
++		"/private/var/root",
++		"/System/Library/Caches/com.apple.dyld",
++	};
++	vfs_context_t ctx = vfs_context_kernel();
++
++	for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); ++i) {
++		vnode_t vp = NULLVP;
++		int probe = vnode_lookup(paths[i], 0, &vp, ctx);
++		printf("opi5plus: path %s -> %d\n", paths[i], probe);
++		if (probe == 0 && vp != NULLVP) {
++			vnode_put(vp);
++		}
++	}
++}
++
++/*
++ * The heartbeat and the process table. A userland whose output goes to logd is otherwise a black box: the
++ * exec trace says which program started last, and this says whether it is still there and in which state.
++ *
++ * The heartbeat goes out through PE_kputc, the platform expert's own character output, so it does not take
++ * the BSD console lock. That is the point of it: when the console goes silent, this line still says whether
++ * the kernel is running, which separates "a thread holds the console" from "the machine is stuck".
++ */
++extern struct proclist allproc;
++extern volatile uint64_t native_sd_block_requests;
++extern volatile uint64_t native_sd_block_failures;
++extern volatile uint64_t native_sd_blocks_read;
++
++static void
++opi5plus_pe_char(char c)
++{
++	extern void (*PE_kputc)(char);
++	if (PE_kputc) {
++		PE_kputc(c);
++	}
++}
++
++static void
++opi5plus_pe_puts(const char *text)
++{
++	while (*text) {
++		opi5plus_pe_char(*text++);
++	}
++}
++
++static void
++opi5plus_pe_number(unsigned long long value)
++{
++	char digits[24];
++	int count = 0;
++
++	if (value == 0) {
++		opi5plus_pe_char('0');
++		return;
++	}
++	while (value != 0 && count < (int)sizeof(digits)) {
++		digits[count++] = (char)('0' + (value % 10));
++		value /= 10;
++	}
++	while (count > 0) {
++		opi5plus_pe_char(digits[--count]);
++	}
++}
++
++static void
++opi5plus_ps_thread(void *arg, wait_result_t wret)
++{
++	uint32_t interval = 0;
++	uint32_t rebootAfter = 0;
++	uint32_t elapsed = 0;
++
++	(void)PE_parse_boot_argn("sd-ps", &interval, sizeof(interval));
++	/* sd-auto-reboot=N: panic after N seconds so the board goes back to the card by itself (the PSCI
++	 * restart in this port resets on panic). Without it every run leaves the board inside XNU and the next
++	 * payload cannot be pushed. */
++	(void)PE_parse_boot_argn("sd-auto-reboot", &rebootAfter, sizeof(rebootAfter));
++	if (!interval && !rebootAfter) {
++		(void)thread_terminate(current_thread());
++		return;
++	}
++	while (1) {
++		(void)tsleep(&allproc, PUSER, "opi5ps", (int)(5 * hz));
++		elapsed += 5;
++		opi5plus_pe_puts("\r\nopi5plus beat ");
++		opi5plus_pe_number(elapsed);
++		opi5plus_pe_puts(" s, requests ");
++		opi5plus_pe_number(native_sd_block_requests);
++		opi5plus_pe_puts(", blocks ");
++		opi5plus_pe_number(native_sd_blocks_read);
++		opi5plus_pe_puts(", failures ");
++		opi5plus_pe_number(native_sd_block_failures);
++		/* How many processes are alive, so a launchd that exits is visible even when the console is not. */
++		{
++			unsigned live = 0;
++			proc_t walk;
++			for (walk = allproc.lh_first; walk != 0; walk = walk->p_list.le_next) {
++				live++;
++			}
++			opi5plus_pe_puts(", procs ");
++			opi5plus_pe_number(live);
++		}
++		/* The display probe's last step, so a boot that stops before launchd still says where it stopped. */
++		opi5plus_pe_puts(", stage ");
++		opi5plus_pe_number(opi5plus_probe_stage());
++		opi5plus_pe_puts(" (");
++		opi5plus_pe_puts(opi5plus_probe_stage_name());
++		opi5plus_pe_puts(")");
++		/*
++		 * Memory headroom and what is left on the Data volume, on the line the beat already writes: a boot that
++		 * runs out of pages and a boot that fills /private/var with logs look the same from the outside otherwise.
++		 * vfs_statfs() answers from the mount's cached statistics -- no lock and no call into the file system;
++		 * vfs_update_vfsstat() would send VFS_STATFS down and can block.
++		 */
++		{
++			struct vfsstatfs *statfs = NULL;
++			mount_t data = opi5plus_data_mount;
++			unsigned long long vfree_pages = 0;
++			unsigned long long vspec_pages = 0;
++			unsigned long long vcomp_pages = 0;
++
++			opi5plus_vm_page_counts(&vfree_pages, &vspec_pages, &vcomp_pages);
++			opi5plus_pe_puts(", vfree ");
++			opi5plus_pe_number(vfree_pages);
++			opi5plus_pe_puts(", vspec ");
++			opi5plus_pe_number(vspec_pages);
++			opi5plus_pe_puts(", vcomp ");
++			opi5plus_pe_number(vcomp_pages);
++			if (data != NULL && !vfs_isunmount(data)) {
++				statfs = vfs_statfs(data);
++			}
++			opi5plus_pe_puts(", dbavail ");
++			if (statfs == NULL) {
++				opi5plus_pe_puts("-1");
++			} else {
++				opi5plus_pe_number((unsigned long long)statfs->f_bavail);
++			}
++		}
++		opi5plus_pe_puts("\r\n");
++		/* Process exits since the last beat: the ring is filled from every exit_with_reason() and printed
++		 * here, by the thread that already writes the beat line straight to the UART. It sits after the
++		 * watchdog kick on purpose: a printf on this console can block while logd floods it with ENOSPC
++		 * lines, and a wedged beat thread would also stop the auto-reboot timer (measured: the board
++		 * stayed in XNU past sd-auto-reboot when this call was a printf placed before the kick). */
++		native_sd_watchdog_kick();
++		opi5plus_report_exits();
++		if (interval != 0 && (elapsed % interval) == 0) {
++			printf("opi5plus: sd io %llu requests %llu blocks %llu failures, uptime %u s\n",
++			    (unsigned long long)native_sd_block_requests,
++			    (unsigned long long)native_sd_blocks_read,
++			    (unsigned long long)native_sd_block_failures, elapsed);
++			proc_t scan;
++			for (scan = allproc.lh_first; scan != 0; scan = scan->p_list.le_next) {
++				printf("opi5plus: ps %d(%s) stat %d flag %#x ppid %d\n", proc_getpid(scan),
++				    scan->p_comm, (int)scan->p_stat, scan->p_flag, scan->p_ppid);
++			}
++		}
++		if (rebootAfter != 0 && elapsed >= rebootAfter) {
++			/*
++			 * A panic resets this board (the port's PSCI restart). Stop-kicking-the-watchdog was the original
++			 * form and it is strictly worse: it only resets if the watchdog was armed, and on 2026-11-08 a
++			 * run reached this branch with no "watchdog armed" line at all and stayed in the kernel for
++			 * half an hour, which costs a manual power cycle. The panic string goes out through the hook in
++			 * osfmk/kern/debug.c, which writes the UART directly, so a held console does not swallow it.
++			 */
++			opi5plus_pe_puts("\r\nopi5plus: sd-auto-reboot, resetting\r\n");
++			panic("opi5plus: sd-auto-reboot after %u s", elapsed);
++		}
++	}
++}
++
++void
++opi5plus_start_ps_thread(void)
++{
++	thread_t thread;
++
++	if (kernel_thread_start(opi5plus_ps_thread, NULL, &thread) == KERN_SUCCESS) {
++		thread_deallocate(thread);
++	}
++}
++
++#endif /* DEVELOPMENT || DEBUG */
++
++#if DEVELOPMENT || DEBUG
++int
++opi5plus_trace_exec(proc_t p, struct execve_args *uap)
++{
++	static int enabled = -1;
++	char name[96];
++	size_t length = 0;
++
++	if (enabled < 0) {
++		uint32_t value = 0;
++		(void) PE_parse_boot_argn("sd-exec", &value, sizeof(value));
++		enabled = value != 0;
++	}
++	if (!enabled || !uap) {
++		return 0;
++	}
++	if (copyinstr(uap->fname, name, sizeof(name), &length) != 0 || !length) {
++		return 0;
++	}
++	/* Straight to the UART: by the time the userland is starting programs, the console is usually held by a
++	 * thread that is waiting for the card, and a printf here would never appear. */
++	opi5plus_pe_puts("\r\nopi5plus: exec ");
++	opi5plus_pe_number(proc_getpid(p));
++	opi5plus_pe_puts(" ");
++	opi5plus_pe_puts(name);
++	opi5plus_pe_puts("\r\n");
++	return 0;
++}
++#endif /* DEVELOPMENT || DEBUG */
++
++#if DEVELOPMENT || DEBUG
++#define OPI5PLUS_EXIT_RING 192
++struct opi5plus_exit_event {
++	char name[24];
++	int pid;
++	int rv;
++	/* p_start.tv_sec: the wall-clock second the process started in (kern_fork.c sets it with
++	 * microtime_with_abstime), so the report can say how long it lived. */
++	long long start;
++};
++static struct opi5plus_exit_event opi5plus_exit_ring[OPI5PLUS_EXIT_RING];
++static volatile uint32_t opi5plus_exit_head, opi5plus_exit_tail;
++static volatile uint32_t opi5plus_exit_total, opi5plus_exit_dropped;
++
++static int
++opi5plus_exit_enabled(void)
++{
++	static int enabled = -1;
++
++	if (enabled < 0) {
++		uint32_t value = 0;
++		(void) PE_parse_boot_argn("sd-exit", &value, sizeof(value));
++		enabled = value != 0;
++	}
++	return enabled;
++}
++
++/* The user backtrace itself belongs to the thread-sample patch (0004); this side only declares it, so a
++ * kernel built without that patch still links. */
++extern void opi5plus_ubt_for_thread(task_t task, thread_t thread);
++
++/*
++ * At most three backtraces per process name: a crash loop repeats the same frames, and the serial line
++ * cannot afford them. The comparison is a prefix because p_comm is cut to about fifteen characters, so a
++ * strcmp() could never match a longer name.
++ */
++#define OPI5PLUS_EXIT_UBT_NAMES 16
++#define OPI5PLUS_EXIT_UBT_PER_NAME 3
++static int
++opi5plus_exit_ubt_allowed(const char *comm)
++{
++	static char seen[OPI5PLUS_EXIT_UBT_NAMES][24];
++	static int counts[OPI5PLUS_EXIT_UBT_NAMES];
++	static int used;
++	int i;
++
++	for (i = 0; i < used; ++i) {
++		if (strncmp(seen[i], comm, 15) == 0) {
++			if (counts[i] >= OPI5PLUS_EXIT_UBT_PER_NAME) {
++				return 0;
++			}
++			counts[i]++;
++			return 1;
++		}
++	}
++	if (used == OPI5PLUS_EXIT_UBT_NAMES) {
++		return 0;
++	}
++	strlcpy(seen[used], comm, sizeof(seen[used]));
++	counts[used] = 1;
++	used++;
++	return 1;
++}
++
++void
++opi5plus_trace_exit(proc_t p, int rv)
++{
++	uint32_t head, tail;
++	struct opi5plus_exit_event *event;
++
++	if (!p || !opi5plus_exit_enabled()) {
++		return;
++	}
++	/*
++	 * exit(n) with n != 0, walked from the thread that is exiting: the only moment its user registers still
++	 * describe the frame that failed. W_EXITCODE puts n in bits 8..15 and leaves the low seven zero; a signal
++	 * death has them set and is already walked by opi5plus_crash_trace() (0005-crash-trace.patch), so it is
++	 * left alone here -- printing the same frames twice costs serial time and says nothing new.
++	 */
++	if ((rv & 0x7f) == 0 && ((rv >> 8) & 0xff) != 0 && opi5plus_exit_ubt_allowed(p->p_comm)) {
++		opi5plus_ubt_for_thread(proc_task(p), current_thread());
++	}
++	head = opi5plus_exit_head;
++	tail = opi5plus_exit_tail;
++	opi5plus_exit_total++;
++	if (head - tail >= OPI5PLUS_EXIT_RING) {
++		opi5plus_exit_dropped++;
++		return;
++	}
++	event = &opi5plus_exit_ring[head % OPI5PLUS_EXIT_RING];
++	strlcpy(event->name, p->p_comm, sizeof(event->name));
++	event->pid = proc_getpid(p);
++	event->rv = rv;
++	event->start = (long long)p->p_start.tv_sec;
++	opi5plus_exit_head = head + 1;
++}
++
++static void
++opi5plus_pe_hex(unsigned value)
++{
++	char digits[10];
++	int count = 0;
++
++	opi5plus_pe_char('0');
++	opi5plus_pe_char('x');
++	do {
++		unsigned nibble = value & 0xf;
++
++		digits[count++] = (char)(nibble < 10 ? '0' + nibble : 'a' + (nibble - 10));
++		value >>= 4;
++	} while (value != 0 && count < (int)sizeof(digits));
++	while (count > 0) {
++		opi5plus_pe_char(digits[--count]);
++	}
++}
++
++static void
++opi5plus_report_exits(void)
++{
++	uint32_t tail = opi5plus_exit_tail;
++	uint32_t head = opi5plus_exit_head;
++	unsigned budget = 24;
++	struct timeval now = {0, 0};
++	extern void microtime(struct timeval *tv);
++
++	if (!opi5plus_exit_enabled()) {
++		return;
++	}
++	/* Straight to the UART, like the beat line: the console's own lock is held for minutes at a time by
++	 * logd's ENOSPC storm, and printf there would wedge this thread and its auto-reboot timer with it. */
++	/* p_start is wall-clock (microtime_with_abstime), not an uptime: the age is taken against microtime(),
++	 * once per report and only when there is something to print. */
++	if (tail != head) {
++		microtime(&now);
++	}
++	while (tail != head && budget-- != 0) {
++		struct opi5plus_exit_event *event = &opi5plus_exit_ring[tail % OPI5PLUS_EXIT_RING];
++		int rv = event->rv;
++		int signal = rv & 0x7f;
++
++		/* W_EXITCODE(code, sig): a signal death is a signal number in the low seven bits, an exit(n)
++		 * is n in bits 8..15. */
++		opi5plus_pe_puts("\r\nopi5plus: exit ");
++		opi5plus_pe_puts(event->name);
++		opi5plus_pe_puts("[");
++		opi5plus_pe_number((unsigned long long)event->pid);
++		opi5plus_pe_puts("] rv ");
++		opi5plus_pe_hex((unsigned)rv);
++		opi5plus_pe_puts(" sig ");
++		opi5plus_pe_number((unsigned long long)(signal != 0x7f ? signal : 0));
++		opi5plus_pe_puts(" code ");
++		opi5plus_pe_number((unsigned long long)((rv >> 8) & 0xff));
++		opi5plus_pe_puts(" age ");
++		if (event->start == 0 || (long long)now.tv_sec < event->start) {
++			opi5plus_pe_puts("-1");
++		} else {
++			opi5plus_pe_number((unsigned long long)((long long)now.tv_sec - event->start));
++		}
++		tail++;
++	}
++	opi5plus_exit_tail = tail;
++	if (opi5plus_exit_head - opi5plus_exit_tail >= OPI5PLUS_EXIT_RING && opi5plus_exit_dropped != 0) {
++		opi5plus_pe_puts("\r\nopi5plus: exit records dropped ");
++		opi5plus_pe_number(opi5plus_exit_dropped);
++		opi5plus_pe_puts(" of ");
++		opi5plus_pe_number(opi5plus_exit_total);
++		opi5plus_exit_dropped = 0;
++	}
++}
++#endif /* DEVELOPMENT || DEBUG */
+diff --git a/bsd/kern/kern_exit.c b/bsd/kern/kern_exit.c
+index 11a8212..2ec212f 100644
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1508,6 +1508,12 @@ exit_with_reason(proc_t p, int rv, int *retval, boolean_t thread_can_terminate,
+ 	 * Debug boot-arg: panic here if matching process is exiting with non-zero code.
+ 	 * Example usage: panic_on_error_exit=launchd,logd,watchdogd
+ 	 */
++#if DEVELOPMENT || DEBUG
++	{
++		extern void opi5plus_trace_exit(proc_t, int);
++		opi5plus_trace_exit(p, rv);
++	}
++#endif
+ 	if (rv && strnstr(panic_on_eexit_pcomms, p->p_comm, sizeof(panic_on_eexit_pcomms))) {
+ 		panic("%s: Process %s with pid %d exited on error with code 0x%x.",
+ 		    __FUNCTION__, p->p_comm, proc_getpid(p), rv);
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+index e9daeed..e4daf1b 100644
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1184,6 +1184,17 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
+ 	INJECT_NESTED_PANIC_IF_REQUESTED(PANIC_TEST_CASE_RECURPANIC_ENTRY);
+ #endif
+ 
++	{
++		/* Orange Pi 5 Plus: the formatted panic string, out the UART before the console tries. */
++		extern void (*PE_kputc)(char c);
++		const char *opi5plus_text = panic_format_str;
++		if (PE_kputc != NULL) {
++			while (*opi5plus_text != 0) {
++				PE_kputc(*opi5plus_text++);
++			}
++			PE_kputc('\n');
++		}
++	}
+ 	PE_panic_hook(panic_format_str);
+ 
+ #if defined (__x86_64__)
+@@ -2262,3 +2273,23 @@ set_awl_scratch_exists_flag_and_subscribe_for_pm(void)
+ 	}
+ }
+ STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, set_awl_scratch_exists_flag_and_subscribe_for_pm);
++
++/*
++ * Orange Pi 5 Plus: the page counters of the beat line (vfree, vspec, vcomp). A bsd object cannot include
++ * <vm/vm_page.h> itself -- the header is not exported, and its kern/misc_protos.h declares setbit(), which
++ * bsd/sys/param.h already defines as a macro -- so the numbers cross over here.
++ */
++void
++opi5plus_vm_page_counts(unsigned long long *free_pages, unsigned long long *speculative_pages,
++    unsigned long long *compressor_pages)
++{
++	if (free_pages != NULL) {
++		*free_pages = vm_page_free_count;
++	}
++	if (speculative_pages != NULL) {
++		*speculative_pages = vm_page_speculative_count;
++	}
++	if (compressor_pages != NULL) {
++		*compressor_pages = (unsigned long long)VM_PAGE_COMPRESSOR_COUNT;
++	}
++}

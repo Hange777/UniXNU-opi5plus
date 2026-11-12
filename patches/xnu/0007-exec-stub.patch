@@ -1,0 +1,122 @@
+Orange Pi 5 Plus: put a payload directory over /usr/libexec, so a sealed daemon can be replaced.
+
+The com.apple.mobileactivationd job runs /usr/libexec/mobileactivationd, which dies by design on this
+port, and SpringBoard waits on its XPC reply for the rest of the boot (evidence/m7/M7-08, M7-09). The
+payload now carries a stand-in at addons/exec/mobileactivationd (written by the GPU add-on installer),
+and this mounts that directory over /usr/libexec with the same read-only union the extensions mount
+uses. The size of the resolved path is printed before and after, because that is what says whether the
+union put the replacement in front of the sealed binary. sd-exec-stub=0 turns it off.
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -10180,10 +10180,110 @@
+ 	opi5plus_addon_status = opi5plus_addon_mount(p, scratch, ctx);
+ 	printf("opi5plus: addon: mounted over " OPI5PLUS_ADDON_POINT ": stage %d status %d (5 = our bundle visible next to the sealed ones)\n",
+ 	    opi5plus_addon_stage, opi5plus_addon_status);
++	{
++		/* The same payload also carries the replacement for the sealed binary launchd starts as
++		 * mobileactivationd; see the block below. */
++		extern int opi5plus_exec_stub(proc_t, user_addr_t);
++		(void)opi5plus_exec_stub(p, scratch);
++	}
+ 	return opi5plus_addon_status;
+ }
+ #endif /* DEVELOPMENT || DEBUG */
+ 
++#if DEVELOPMENT || DEBUG
++/*
++ * Orange Pi 5 Plus: a payload directory over /usr/libexec, so one sealed binary can be replaced.
++ *
++ * launchd starts the com.apple.mobileactivationd job at /usr/libexec/mobileactivationd, and on this port that
++ * binary dies by design in its own main() error path (evidence/m7/M7-09): SpringBoard's main thread then waits
++ * for a reply that never comes and the UI never starts (evidence/m7/M7-08). The payload carries a replacement
++ * at addons/exec/mobileactivationd, which the GPU add-on installer above has already written to the Data
++ * volume by the time this runs; the read-only union puts it over the sealed one without touching the sealed
++ * volume. The size of the path after the mount says which of the two is being resolved, which is the only
++ * cheap way to see the union precedence from the board (the sealed binary is 2960496 bytes, the replacement
++ * about 70 KiB).
++ *
++ * sd-exec-stub=0 turns it off. Never fatal: the status and both sizes are printed and the boot goes on.
++ */
++#define OPI5PLUS_EXEC_SOURCE OPI5PLUS_NGPU_DIR "/addons/exec"
++#define OPI5PLUS_EXEC_POINT "/usr/libexec"
++#define OPI5PLUS_EXEC_FILE OPI5PLUS_EXEC_POINT "/mobileactivationd"
++
++static volatile int opi5plus_exec_stage;
++static volatile int opi5plus_exec_status = -1;
++
++static int64_t
++opi5plus_exec_size(vfs_context_t ctx)
++{
++	vnode_t vnode = NULLVP;
++	struct vnode_attr attributes;
++	int error;
++
++	if (vnode_lookup(OPI5PLUS_EXEC_FILE, 0, &vnode, ctx) != 0) {
++		return -1;
++	}
++	VATTR_INIT(&attributes);
++	VATTR_WANTED(&attributes, va_data_size);
++	error = vnode_getattr(vnode, &attributes, ctx);
++	vnode_put(vnode);
++	return error ? -1 : (int64_t)attributes.va_data_size;
++}
++
++/* The same user-mount payload the extensions union uses, with a different source and target. */
++static int
++opi5plus_exec_mount(proc_t p, user_addr_t scratch, vfs_context_t ctx)
++{
++	struct mount_args request = {.type = scratch + 0x100, .path = scratch + 0x120,
++		.flags = MNT_RDONLY | MNT_UNION, .data = scratch + 0x200};
++	int32_t result = 0;
++	vnode_t probe = NULLVP;
++	int error;
++
++	opi5plus_exec_stage = 1;
++	if ((error = vnode_lookup(OPI5PLUS_EXEC_SOURCE, 0, &probe, ctx)) != 0) {
++		return error;
++	}
++	vnode_put(probe);
++	probe = NULLVP;
++	opi5plus_exec_stage = 2;
++	if ((error = copyout("bindfs", request.type, 7)) ||
++	    (error = copyout(OPI5PLUS_EXEC_POINT, request.path, sizeof(OPI5PLUS_EXEC_POINT))) ||
++	    (error = copyout(OPI5PLUS_EXEC_SOURCE, request.data, sizeof(OPI5PLUS_EXEC_SOURCE)))) {
++		return error;
++	}
++	native_bindfs_boot_mount = 1;
++	error = mount(p, &request, &result);
++	native_bindfs_boot_mount = 0;
++	if (error) {
++		return error;
++	}
++	opi5plus_exec_stage = 3;
++	return 0;
++}
++
++int
++opi5plus_exec_stub(proc_t p, user_addr_t scratch)
++{
++	vfs_context_t ctx = vfs_context_current();
++	uint32_t want = 1;
++	int64_t before, after;
++	int error;
++
++	(void)PE_parse_boot_argn("sd-exec-stub", &want, sizeof(want));
++	if (!want) {
++		printf("opi5plus: exec: sd-exec-stub=0, " OPI5PLUS_EXEC_POINT " is left as it is\n");
++		return 0;
++	}
++	before = opi5plus_exec_size(ctx);
++	error = opi5plus_exec_mount(p, scratch, ctx);
++	after = opi5plus_exec_size(ctx);
++	opi5plus_exec_status = error;
++	printf("opi5plus: exec: " OPI5PLUS_EXEC_POINT " over " OPI5PLUS_EXEC_SOURCE ": stage %d status %d; "
++	    OPI5PLUS_EXEC_FILE " %lld -> %lld bytes\n", opi5plus_exec_stage, error, before, after);
++	return error;
++}
++#endif /* DEVELOPMENT || DEBUG */
++
+ #if DEVELOPMENT || DEBUG
+ #define OPI5PLUS_EXIT_RING 192
+ struct opi5plus_exit_event {

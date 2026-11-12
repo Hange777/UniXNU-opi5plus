@@ -1,0 +1,72 @@
+Orange Pi 5 Plus: where a process died, for the daemons that trap every few seconds.
+
+The exit ring (0002) already says which process went away and with which rv/signal. This adds the
+fault site: the signal death's saved user registers (pc, lr, sp, fp, x0, x1, x16, esr, far) and the
+frame-pointer chain of the user stack, from the same block 0004 appended to osfmk/kern/bsd_kern.c,
+called from exit_with_reason() in bsd/kern/kern_exit.c. Symbolise against the dyld shared cache slide
+that 0004's sampler prints. Answers why mobileactivation (SIGTRAP), assistantd / dmd /
+PerfPowerService (SIGABRT) and privacyaccountingd (SIGTRAP) never answer SpringBoard's synchronous
+XPC calls.
+
+--- a/osfmk/kern/bsd_kern.c
++++ b/osfmk/kern/bsd_kern.c
+@@ -1675,3 +1675,46 @@
+ 	}
+ 	task_unlock(task);
+ }
++
++
++/*
++ * Orange Pi 5 Plus: where a process died.
++ *
++ * The exit ring in kern_exit.c says which process went away and whether it was an exit code or a signal.
++ * This says where it was when the signal arrived: the faulting thread's saved user registers and the
++ * frame-pointer chain of its user stack, so the addresses can be symbolised against the dyld shared cache
++ * (the sampler's "cache base ... slide" line gives the slide). The daemons that die every few seconds
++ * -- mobileactivation, assistantd, dmd, fitcored, privacyaccountingd, ScreenTimeAgent -- have so far only
++ * shown rv/signal in the log; their own stderr goes to logd and never reaches the console.
++ *
++ * It is called from exit_with_reason() with the exiting process's pid and name; the registers read are the
++ * current thread's, which is the thread that took the signal.
++ */
++void
++opi5plus_crash_trace(int pid, const char *comm, int rv)
++{
++	thread_t thread = current_thread();
++	task_t task = current_task();
++	struct arm_saved_state *user;
++	int sig = rv & 0x7f;
++
++	if (sig == 0) {
++		return;
++	}
++	user = get_user_regs(thread);
++	if (user == NULL) {
++		printf("opi5: crash pid %d (%s) rv %#x sig %d: no user state\n", pid, comm, rv, sig);
++		return;
++	}
++	printf("opi5: crash pid %d (%s) rv %#x sig %d pc %#llx lr %#llx sp %#llx fp %#llx x0 %#llx "
++	    "x1 %#llx x16 %#llx esr %#x far %#llx\n", pid, comm, rv, sig,
++	    (unsigned long long)get_saved_state_pc(user),
++	    (unsigned long long)get_saved_state_lr(user),
++	    (unsigned long long)get_saved_state_sp(user),
++	    (unsigned long long)get_saved_state_fp(user),
++	    (unsigned long long)get_saved_state_reg(user, 0),
++	    (unsigned long long)get_saved_state_reg(user, 1),
++	    (unsigned long long)get_saved_state_reg(user, 16),
++	    get_saved_state_esr(user), (unsigned long long)get_saved_state_far(user));
++	opi5plus_user_chain(task, thread, user);
++}
+--- a/bsd/kern/kern_exit.c
++++ b/bsd/kern/kern_exit.c
+@@ -1514,6 +1514,10 @@
+ 		extern void opi5plus_trace_exit(proc_t, int);
+ 		opi5plus_trace_exit(p, rv);
+ 	}
++	{
++		extern void opi5plus_crash_trace(int, const char *, int);
++		opi5plus_crash_trace(proc_getpid(p), p->p_comm, rv);
++	}
+ #endif
+ 	if (rv && strnstr(panic_on_eexit_pcomms, p->p_comm, sizeof(panic_on_eexit_pcomms))) {
+ 		panic("%s: Process %s with pid %d exited on error with code 0x%x.",

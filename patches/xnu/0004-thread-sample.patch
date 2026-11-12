@@ -1,0 +1,421 @@
+Orange Pi 5 Plus: where a task's threads are, asked by name from the heartbeat.
+
+Brings UniXNU-evb10's evb10-thread-sample diagnostics to this board in the form this board needs:
+the block appended to osfmk/kern/bsd_kern.c (private access to struct thread and the saved user
+state), the caller in the heartbeat that already walks allproc (bsd/kern/kern_exec.c), and no
+kernel-stack walk at all. Boot args: opi5plus-bt / opi5plus-bt2 ... opi5plus-bt8 name up to eight
+processes, 16 characters each, because PE_parse_boot_argn copies max_len - 1 bytes into the 17-byte
+buffer. opi5plus-bt-secs=N sets the period (default: off). Answers "what is SpringBoard waiting on"
+with a frame-pointer chain that can be symbolised against the boot's dyld shared cache slide.
+
+Each thread's line also carries bh, thread->block_hint, and wq, thread->waitq, so "waiting" is named
+without symbolising the stack: 2 is a port receive, 6 a semaphore, 0xb a pthread mutex, 0xe a condvar,
+and any other value is printed as it stands. Both are read under the task lock with the rest of the
+line, and they are what separates SpringBoard waiting on a synchronous XPC reply from SpringBoard
+waiting on its own main-thread lock.
+
+The block also serves the exit path. opi5plus_ubt_for_thread(task, thread) prints the same
+frame-pointer chain for a thread of a task that is going away; bsd/kern/kern_exit.c's exit_with_reason()
+declares it extern and calls it for a signal death, and every character goes out through PE_kputc
+instead of printf, for the reason 0002 records about that path: the console's lock is held for minutes
+at a time by logd's ENOSPC storm, and a thread about to exit must not wait for it. It takes no task
+lock, assumes nothing about the current thread, prints at most fourteen frames, and ends the chain
+rather than panicking when the user stack cannot be read.
+
+The exit line also names the image a frame belongs to. It starts with the process and its own image's
+base: opi5plus_text_base() takes the start of the lowest executable mapping of the task's map, which on
+iOS is the main executable's __TEXT (the __PAGEZERO below it carries no execute, and the dyld shared
+cache is at 0x180000000 and above). A frame at or above that base and below the cache is in the
+process's own image, one above it is in the cache, and the ASLR slide no longer has to be guessed before
+a frame means anything. The exit path cannot wait for a lock, so the map's read lock is taken only if it
+is free, and a map that is gone, a start that is not on a 16 KB page or a walk that will not end print
+"text -" instead of a number.
+
+--- a/osfmk/kern/bsd_kern.c
++++ b/osfmk/kern/bsd_kern.c
+@@ -1526,3 +1526,358 @@ bsd_to_mach_failure(int bsd_err)
+ 		return KERN_FAILURE;
+ 	}
+ }
++
++
++/*
++ * Orange Pi 5 Plus: where a task's threads are.
++ *
++ * The heartbeat (kern_exec.c, opi5plus_ps_thread) calls this for every process once every
++ * opi5plus-bt-secs seconds. A process named by one of the eight opi5plus-bt...-bt8 arguments gets, for
++ * each thread, the registers it had at its last trap from user mode and the
++ * frame-pointer chain of its user stack: where SpringBoard or backboardd sits when it has stopped making
++ * progress. The addresses are shared-cache addresses after this boot's slide (the "cache base ... slide"
++ * line says which), so a frame that does not move between two beats is a thread that is waiting, and
++ * symbolising the chain names what it waits in.
++ *
++ * It only reads. The target's task lock is taken for the walk, a thread that blocked with a continuation
++ * has no kernel stack (machine_stack_detach clears kstackptr and machine_trace_thread64 does not check), so
++ * no kernel stack is walked here at all.
++ *
++ * It lives in bsd_kern.c because struct thread, struct task and the saved user state are private to osfmk.
++ */
++#include <pexpert/pexpert.h>
++#include <vm/vm_shared_region.h>
++
++#define OPI5PLUS_BT_NAMES   8
++#define OPI5PLUS_BT_THREADS 24
++#define OPI5PLUS_BT_FRAMES  14
++#define OPI5PLUS_TEXT_ALIGN 0x3fffu     /* the 16 KB page every user map of this board is built on */
++
++extern char *proc_name_address(void *p);
++extern struct arm_saved_state *get_user_regs(thread_t thread);
++
++static int opi5plus_bt_state;   /* 0 not read yet, 1 no names, 2 at least one name */
++static char opi5plus_bt_names[OPI5PLUS_BT_NAMES][17];    /* 16 characters and the terminator */
++
++static const char *
++opi5plus_bt_wanted(task_t task)
++{
++	void *bsd;
++	int i;
++
++	if (opi5plus_bt_state == 0) {
++		static const char *const keys[OPI5PLUS_BT_NAMES] = {
++			"opi5plus-bt", "opi5plus-bt2", "opi5plus-bt3", "opi5plus-bt4",
++			"opi5plus-bt5", "opi5plus-bt6", "opi5plus-bt7", "opi5plus-bt8"
++		};
++
++		opi5plus_bt_state = 1;
++		for (i = 0; i < OPI5PLUS_BT_NAMES; i++) {
++			if (PE_parse_boot_argn(keys[i], opi5plus_bt_names[i],
++			    sizeof(opi5plus_bt_names[i]))) {
++				opi5plus_bt_state = 2;
++			}
++		}
++	}
++	if (opi5plus_bt_state != 2) {
++		return NULL;
++	}
++	bsd = get_bsdtask_info(task);
++	if (bsd == NULL) {
++		return NULL;
++	}
++	for (i = 0; i < OPI5PLUS_BT_NAMES; i++) {
++		if (opi5plus_bt_names[i][0] != 0 &&
++		    strncmp(proc_name_address(bsd), opi5plus_bt_names[i], 16) == 0) {
++			return opi5plus_bt_names[i];
++		}
++	}
++	return NULL;
++}
++
++/*
++ * One link of a user stack's frame-pointer chain: the frame pointer the pair was read at and the return
++ * address it holds. Both entry points below print these pairs; a frame that does not move between two
++ * beats belongs to a thread that is waiting, and the return address names the caller that waits in it.
++ */
++struct opi5plus_ubt_frame {
++	uint64_t fp;
++	uint64_t lr;
++};
++
++/*
++ * Walk the user stack of a thread from the frame pointer it was last trapped at, and fill in at most
++ * OPI5PLUS_BT_FRAMES links. A read that fails -- a stack unmapped under us, a frame that is not in the
++ * map -- ends the chain quietly, because one caller below runs on the exit path and a fault there would
++ * be worse than a short trace.
++ */
++static int
++opi5plus_user_frames(task_t task, struct arm_saved_state *user, struct opi5plus_ubt_frame *frames)
++{
++	uint64_t fp;
++	int n = 0;
++
++	if (task == TASK_NULL || task->map == NULL || user == NULL) {
++		return 0;
++	}
++	fp = get_saved_state_fp(user);
++	while (n < OPI5PLUS_BT_FRAMES && fp != 0 && (fp & 7) == 0) {
++		uint64_t frame[2];
++
++		if (vm_map_read_user(task->map, (vm_map_offset_t)fp, frame,
++		    sizeof(frame)) != KERN_SUCCESS) {
++			break;
++		}
++		frames[n].fp = fp;
++		frames[n].lr = frame[1];
++		n++;
++		if (frame[0] <= fp) {
++			break;
++		}
++		fp = frame[0];
++	}
++	return n;
++}
++
++/*
++ * Where the process's own image starts: the beginning of the lowest executable mapping of its map, which
++ * on iOS is the main executable's __TEXT. Nothing below it is executable (__PAGEZERO is not mapped, or
++ * mapped without execute), and the dyld shared cache sits at 0x180000000 and above, so a frame at or
++ * above this base and below the cache is in this process's own image and one above it is in the cache.
++ * That attribution is what a 0x100xxxxxx frame could not get while the slide was unknown.
++ *
++ * The map of a task that is going away belongs to nobody, so the read lock is taken only if it is
++ * already free: a writer holds the map for the length of an mmap, an exec or a fault that had to grow
++ * the pmap, and this runs on the exit path, which must not wait for one. A held lock, a map that is
++ * gone, a start that is not on a page boundary and a walk that does not end all give zero, and the
++ * caller prints "text -". Nothing here allocates, sleeps or panics.
++ */
++static uint64_t
++opi5plus_text_base(task_t task)
++{
++	vm_map_t map;
++	vm_map_entry_t entry, head;
++	uint32_t left;
++	uint64_t base = 0;
++
++	if (task == TASK_NULL || task->map == NULL) {
++		return 0;
++	}
++	map = task->map;
++	if (!lck_rw_try_lock_shared(&map->lock)) {
++		return 0;
++	}
++	/* The entry list is in address order, so the first executable entry holds the base. */
++	head = vm_map_to_entry(map);
++	left = (uint32_t)map->hdr.nentries;
++	for (entry = vm_map_first_entry(map); entry != head && entry != NULL && left-- > 0;
++	    entry = entry->vme_next) {
++		if ((entry->protection & VM_PROT_EXECUTE) != 0) {
++			base = (uint64_t)entry->vme_start;
++			break;
++		}
++	}
++	lck_rw_done(&map->lock);
++	if (base == 0 || (base & OPI5PLUS_TEXT_ALIGN) != 0) {
++		return 0;
++	}
++	return base;
++}
++
++static void
++opi5plus_user_chain(task_t task, thread_t thread, struct arm_saved_state *user)
++{
++	struct opi5plus_ubt_frame frames[OPI5PLUS_BT_FRAMES];
++	int n = opi5plus_user_frames(task, user, frames), i;
++
++	printf("opi5: ubt tid %#llx pc %#llx lr %#llx sp %#llx fp %#llx | up", thread->thread_id,
++	    (unsigned long long)get_saved_state_pc(user),
++	    (unsigned long long)get_saved_state_lr(user),
++	    (unsigned long long)get_saved_state_sp(user),
++	    (unsigned long long)get_saved_state_fp(user));
++	for (i = 0; i < n; i++) {
++		printf(" %#llx", (unsigned long long)frames[i].lr);
++	}
++	printf("\n");
++}
++
++/*
++ * The exit path cannot use printf: the console's own lock is held for minutes at a time by a logd ENOSPC
++ * storm (the reason 0002 sends its exit ring straight to the UART), and a thread that is leaving cannot
++ * wait for it. These carry the same trace over PE_kputc, the platform expert's own character output,
++ * which takes no console lock at all.
++ */
++static void
++opi5plus_ubt_putc(char c)
++{
++	if (PE_kputc != NULL) {
++		PE_kputc(c);
++	}
++}
++
++static void
++opi5plus_ubt_puts(const char *text)
++{
++	while (*text != 0) {
++		opi5plus_ubt_putc(*text++);
++	}
++}
++
++static void
++opi5plus_ubt_hex(uint64_t value)
++{
++	char digits[18];
++	int count = 0;
++
++	opi5plus_ubt_putc('0');
++	opi5plus_ubt_putc('x');
++	do {
++		digits[count++] = "0123456789abcdef"[value & 0xf];
++		value >>= 4;
++	} while (value != 0 && count < (int)sizeof(digits));
++	while (count > 0) {
++		opi5plus_ubt_putc(digits[--count]);
++	}
++}
++
++/* A pid, in the decimal the rest of the board's lines print it in. */
++static void
++opi5plus_ubt_dec(int value)
++{
++	char digits[12];
++	unsigned magnitude = value < 0 ? 0u - (unsigned)value : (unsigned)value;
++	int count = 0;
++
++	if (value < 0) {
++		opi5plus_ubt_putc('-');
++	}
++	do {
++		digits[count++] = (char)('0' + magnitude % 10);
++		magnitude /= 10;
++	} while (magnitude != 0 && count < (int)sizeof(digits));
++	while (count > 0) {
++		opi5plus_ubt_putc(digits[--count]);
++	}
++}
++
++/*
++ * Orange Pi 5 Plus: where a thread of a dying process was.
++ *
++ * Called from exit_with_reason() with the task that is going away and the thread that took the signal, so
++ * a signal death says where in user space the thread was as well as which registers it held. It assumes
++ * nothing about the current thread and takes no task lock -- its caller is on the way out of the process
++ * and must not sleep -- and it reads the dying task's user map directly. A frame it cannot read ends the
++ * chain; nothing here panics.
++ *
++ * The line names the process and the base of its own image ahead of the registers, so every frame can be
++ * filed under an image without knowing the slide: the name is the dying task's own, read out of its bsd
++ * proc (still alive -- the caller holds the proc), and the base comes from opi5plus_text_base() above.
++ */
++void
++opi5plus_ubt_for_thread(task_t task, thread_t thread)
++{
++	struct opi5plus_ubt_frame frames[OPI5PLUS_BT_FRAMES];
++	struct arm_saved_state *user;
++	void *bsd;
++	char *name = NULL;
++	uint64_t base;
++	int n, i;
++
++	if (task == TASK_NULL || thread == THREAD_NULL) {
++		return;
++	}
++	user = get_user_regs(thread);
++	if (user == NULL) {
++		return;
++	}
++	base = opi5plus_text_base(task);
++	bsd = get_bsdtask_info(task);
++	if (bsd != NULL) {
++		name = proc_name_address(bsd);
++	}
++	n = opi5plus_user_frames(task, user, frames);
++	opi5plus_ubt_puts("\r\nopi5: ubt ");
++	if (name != NULL && name[0] != 0) {
++		opi5plus_ubt_puts(name);
++	} else {
++		opi5plus_ubt_putc('-');
++	}
++	opi5plus_ubt_putc('[');
++	opi5plus_ubt_dec(pid_from_task(task));
++	opi5plus_ubt_puts("] text ");
++	if (base != 0) {
++		opi5plus_ubt_hex(base);
++	} else {
++		opi5plus_ubt_putc('-');
++	}
++	opi5plus_ubt_puts(" tid ");
++	opi5plus_ubt_hex((uint64_t)thread->thread_id);
++	opi5plus_ubt_puts(" pc ");
++	opi5plus_ubt_hex(get_saved_state_pc(user));
++	opi5plus_ubt_puts(" sp ");
++	opi5plus_ubt_hex(get_saved_state_sp(user));
++	opi5plus_ubt_puts(" fp ");
++	opi5plus_ubt_hex(get_saved_state_fp(user));
++	opi5plus_ubt_puts(" | up");
++	for (i = 0; i < n; i++) {
++		opi5plus_ubt_puts(" lr: ");
++		opi5plus_ubt_hex(frames[i].lr);
++		opi5plus_ubt_puts(" fp: ");
++		opi5plus_ubt_hex(frames[i].fp);
++	}
++	opi5plus_ubt_puts("\r\n");
++}
++
++void
++opi5plus_task_sample(task_t task, uint64_t seconds)
++{
++	const char *name;
++	thread_t thread;
++	unsigned shown = 0;
++	vm_shared_region_t sr;
++
++	if (task == TASK_NULL) {
++		return;
++	}
++	name = opi5plus_bt_wanted(task);
++	if (name == NULL) {
++		return;
++	}
++	sr = vm_shared_region_get(task);
++	if (sr != NULL) {
++		printf("opi5: ubt %s at %llu s: cache base %#llx first %#llx slide %#llx\n", name,
++		    (unsigned long long)seconds, (unsigned long long)sr->sr_base_address,
++		    (unsigned long long)sr->sr_first_mapping, (unsigned long long)sr->sr_slide);
++		vm_shared_region_deallocate(sr);
++	}
++	task_lock(task);
++	queue_iterate(&task->threads, thread, thread_t, task_threads) {
++		struct arm_saved_state *user;
++
++		if (++shown > OPI5PLUS_BT_THREADS) {
++			break;
++		}
++		user = get_user_regs(thread);
++		printf("opi5: ubt %s tid %#llx st %#x pri %d/%d cpu %d wait %d ev %#llx "
++		    "cont %#llx bh %#x wq %p",
++		    name, thread->thread_id, (unsigned)thread->state, (int)thread->sched_pri,
++		    (int)thread->base_pri,
++		    thread->last_processor ? thread->last_processor->cpu_id : -1,
++		    (int)thread->wait_result, (unsigned long long)thread->wait_event,
++		    (unsigned long long)(uintptr_t)thread->continuation,
++		    (unsigned)thread->block_hint, (void *)thread->waitq.wq_q);
++		if (user == NULL) {
++			printf(" | no user state\n");
++			continue;
++		}
++		printf(" | user pc %#llx lr %#llx sp %#llx fp %#llx x0 %#llx x16 %#llx\n",
++		    (unsigned long long)get_saved_state_pc(user),
++		    (unsigned long long)get_saved_state_lr(user),
++		    (unsigned long long)get_saved_state_sp(user),
++		    (unsigned long long)get_saved_state_fp(user),
++		    (unsigned long long)get_saved_state_reg(user, 0),
++		    (unsigned long long)get_saved_state_reg(user, 16));
++		opi5plus_user_chain(task, thread, user);
++	}
++	task_unlock(task);
++}
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -9171,6 +9171,7 @@
+ static void opi5plus_pe_puts(const char *text);
+ static void opi5plus_pe_number(unsigned long long value);
+ static void opi5plus_report_exits(void);
++extern void opi5plus_task_sample(task_t task, uint64_t seconds);
+ 
+ /*
+  * The firmware's GOP frame buffer, read out of the loader's own handoff line:
+@@ -9612,6 +9613,16 @@
+ 		 * stayed in XNU past sd-auto-reboot when this call was a printf placed before the kick). */
+ 		native_sd_watchdog_kick();
+ 		opi5plus_report_exits();
++		{
++			uint32_t btseconds = 0;
++			(void)PE_parse_boot_argn("opi5plus-bt-secs", &btseconds, sizeof(btseconds));
++			if (btseconds != 0 && (elapsed % btseconds) == 0) {
++				proc_t scan;
++				for (scan = allproc.lh_first; scan != 0; scan = scan->p_list.le_next) {
++					opi5plus_task_sample(proc_task(scan), elapsed);
++				}
++			}
++		}
+ 		if (interval != 0 && (elapsed % interval) == 0) {
+ 			printf("opi5plus: sd io %llu requests %llu blocks %llu failures, uptime %u s\n",
+ 			    (unsigned long long)native_sd_block_requests,

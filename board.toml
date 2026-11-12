@@ -1,0 +1,373 @@
+schema_version = 2
+
+[board]
+name = "opi5plus"
+soc = "RK3588"
+soc_source = "rk3588"
+os_profile = "ipados-17.7.11-21H461"
+description = "Orange Pi 5 Plus (RK3588, 8 GB, SD only, HDMI only)"
+kit = "opi5plus"
+
+# The raw image `unixnu build userdata` writes for the `userdata` partition. This board has no eMMC and no
+# NVMe: the only block device is the SD card behind `mmc@fe2c0000` (DesignWare MSHC in SD mode, Linux's
+# `dw_mmc`/`sdhci` driver). The placeholder geometry below is the size a 32 GiB card would give the
+# partition; it is NOT the layout of the card in the board.
+#
+# A driver reaches it since 2026-11-04: `sd=4` in package/NativeSd reads the SHNGROOT manifest at the start
+# of the partition named by `sd-root-partition` (default "userdata") and publishes one read-only
+# IOBlockStorageDevice per window, SystemOS first and OS last. The partition is found by its GPT name, so
+# the kernel does not use the numbers below; they stay a placeholder because what is missing is space, not
+# addressing -- the image is 8.74 GiB and the card's only partition holds the Linux root (24 GiB used,
+# 4.8 GiB free). evidence/m4/M4-09-sd-root-windows.md section 5 has the numbers and the three ways out.
+# scripts/porting.toml, area `storage`, records it as planned:
+#   - M4 Plan B: write an SD host driver for `mmc@fe2c0000`; the numbers become real then.
+#   - M4 Plan A: fit the eMMC module and reuse Rk3588Emmc (`mmc@fe2e0000`, `rockchip,rk3588-dwcmshc`),
+#     the driver the EVB10 board already runs. The node exists on this board (the controller is inside
+#     the SoC and the SD is not on it), so Plan A needs no device-tree change, only the module and the
+#     real GPT.
+# Both are deliberately not `device-verified`.
+[userdata]
+first_lba = 32768
+last_lba = 62914559
+lba_bytes = 512
+windows = [
+  { name = "OS", component = "OS" },
+  { name = "SystemOS", component = "Cryptex1,SystemOS" },
+]
+
+[kernel]
+defconfig = "opi5plus_defconfig"
+config_fragments = ["arch:configs/common.config", "soc:configs/rk3588.config", "os:configs/ipados.config"]
+patch_series = ["arch:patches/xnu/series", "soc:patches/xnu/series", "os:patches/xnu/series", "device:patches/xnu/series"]
+# Archive builders of the kernel step, in order. `component:<ID>` entries build a catalog driver; the others
+# are scripts of the build tree (this repository's scripts/ and the SoC's).
+#
+# The list is deliberately SHORTER than UniXNU-evb10's, and every missing entry is missing because this board
+# does not have that hardware or that driver yet. `kernel.py archive_plan()` requires a `component:` entry for
+# exactly ArmCpu, ArmDTPlatform and AppleKeyStoreState (the three catalog components whose build_stage is
+# `kernel`); GopFramebuffer (`embedded`), DarwinBoot (`firmware`) and XnuPrelink (`prelink`) must NOT appear
+# here, and they do not.
+#
+#   dropped  `build-evb10-drivers.py Rk3588Emmc` + `bind-emmc-storage.py`
+#            No eMMC module is fitted (docs/hardware.md; the board's own device tree has no card on
+#            mmc@fe2e0000 either). These two entries go back in this position the day the module arrives, and
+#            Rk3588Emmc then becomes Plan A of [userdata]. Until then they would only fail: the driver sources
+#            are an EVB10 submodule this repository does not have.
+#   dropped  `build-evb10-drivers.py Evb10Touch`
+#            Only HDMI, no DSI panel and no touch controller (plan.md §3.1). Input for M6 is scripted
+#            injection first and USB HID second; neither is a kernel archive today.
+#   dropped  `build-evb10-display.py`
+#            The EVB10's display archive is built from an earlier kernel pass and linked by its own
+#            defconfig; this port's display path is the firmware's GOP frame buffer, and no presenter
+#            archive exists for it yet (see configs/opi5plus_defconfig, "display").
+#   dropped  `build-mali-firmware.py` + `build-evb10-drivers.py Mali`
+#            The GPU is the same Mali-G610 MP4, but the driver, its firmware include and its submodule are
+#            M7 work. board.toml [payload] kernel_args already carry the mali* group so that the switch-on
+#            change is confined to this array.
+#
+# M4/M5/M7 add, in the position shown: a driver builder for the SD host (Plan B) or the eMMC pair (Plan A),
+# a display archive builder, and the Mali pair.
+archives = [
+  # Weak no-op definitions of the hooks the shared SoC series references but this board does not build.
+  # Must run BEFORE the kernel link and before every archive that could define the same symbols strongly.
+  # See package/LinkStubs.c for why the eMMC trust hook is needed here.
+  "build-link-stubs.py",
+  # The mockfs fixture, so that a kernel without a block storage driver still has a root to mount.
+  # profiles/arch/arm64/profile.toml:18 lists it too, but [kernel] archives REPLACES rather than merges the
+  # profile array, so a board that writes its own list has to repeat it. Only needed when
+  # CONFIG_XNU_SOURCE_MOCKFS=y: build-xnu-4k-baseline.sh:738-740 runs `test -f
+  # build/mockfs-fixture/libmockfs_fixture.a` and links the archive with -force_load, and nothing else in the
+  # build produces it -- this script is the only producer, and the kernel step does not call it.
+  "build-mockfs-fixture.py",
+  "build-libpthread-kernel.py",
+  "build-corecrypto-14.py",
+  "build-corecrypto-14.py --namespace",
+  "component:ArmDTPlatform",
+  # ArmCpu has no patch channel: the SoC's script applies its RK3588 fixes to the checkout first.
+  "apply-armcpu-patches.py",
+  "component:ArmCpu",
+  "component:AppleKeyStoreState",
+  # Software AES-CBC behind IOAESAccelerator. The SoC revision this board now pins sets CONFIG_XNU_NATIVE_AES=y
+  # (rk3588.config: "not a SoC crypto engine ... the original AppleImage4 waits for it"), and
+  # build-xnu-4k-baseline.sh:660-661 refuses to link without build/software-aes/libSoftwareAES.a. The component
+  # compiles the cipher, the binding script adds the original IOAESAccelerator addresses.
+  "component:SoftwareAES",
+  "build-software-aes-bindings.py",
+  # The SD host (Plan B): compile, then bind. The order is the dependency.
+  #   build-sd-driver.py NativeSd   package/NativeSd/NativeSd.cpp -> build/native-sd/NativeSd.o, no archive
+  #   bind-sd-storage.py            that object + the audited addresses -> build/native-sd/libNativeSd.a
+  # Compiling deliberately leaves no archive: a subclass of IOBlockStorageDevice only links once its
+  # unexported base symbols have absolute addresses, and letting the compiler's output be linkable would
+  # make it possible to link a driver that was never bound. UniXNU-evb10 does the same with
+  # "build-evb10-drivers.py Rk3588Emmc" then "bind-emmc-storage.py" (board.toml:39-41).
+  #
+  # archive_plan() (repos/UniXNU/scripts/unixnu/kernel.py:83-116) keeps literal entries in this order and
+  # runs them all before build-xnu-4k-baseline.sh. Position relative to the link does not matter:
+  # build-xnu-4k-baseline.sh:755 appends CONFIG_XNU_EXTRA_LD_ARCHIVES after every built-in archive, so
+  # libNativeSd.a is always the last input and the weak stubs above stay ahead of it.
+  #
+  # audit-sd-storage.py is deliberately NOT here. It is not a build step: it reads the pinned original
+  # kernelcache through kernel.json and kernel.macho, which do not exist until the kernel step has run, so
+  # as an archive entry it could not work on a clean build anyway. It writes
+  # scripts/data/opi5plus-storage-interface-audit.json, which is committed -- the same arrangement as
+  # UniXNU-evb10, whose audit JSON sits in scripts/data/ and is never regenerated by a build. Staleness is
+  # caught rather than prevented: bind-sd-storage.py refuses an audit whose original_sha256 is not this
+  # kernel's. Re-record it by hand when the kernelcache pin changes (M4-03, the storage-binding evidence).
+  "build-sd-driver.py NativeSd",
+  "bind-sd-storage.py",
+  # VOP2 zero-copy scanout (UniXNU-rk3588-common scripts/data/Rk3588VopDirect): with rk3588-vop-direct=1 the
+  # display backend flips the compositor's surface into the Esmart window through the VOP IOMMU instead of
+  # CPU-copying into the firmware frame buffer. The GOP copy path never completes the original swap protocol
+  # (evidence/m5/M5-09), so this is the scanout the display step runs on.
+  "build-rk3588-vop-direct.py",
+  # The display archive (M5): the unchanged original IOMobileFramebufferLegacy bound to the GopFramebuffer
+  # component's NativeLegacyDisplay, plus the GOP presenter and the key store stand-in. Gated by
+  # CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y -- the script exits when it is not set, so the display-less pass does
+  # nothing here. It reads the kernel of the display-less pass (configs/opi5plus_defconfig) as its ABI
+  # candidate; see scripts/build-opi5plus-display.py and evidence/m5/M5-01.
+  "build-opi5plus-display.py",
+  # The Mali-G610: the firmware include first, then the driver archive.
+  #   build-mali-firmware.py        .cache/firmware/mali_csffw.bin -> package/Mali/mali_csffw.inc
+  #   build-opi5plus-drivers.py Mali package/Mali/Mali.cpp -> build/mali/libMali.a
+  # The firmware is this board's own BSP copy (the digest is in proprietary-files.txt, and it is NOT the
+  # EVB10's build). CONFIG_XNU_EXTRA_LD_ARCHIVES force-loads the archive, which is what makes
+  # mali_start()/mali_fence_* resolve once the inert stubs in package/LegacyDisplayProbe.cpp are gone.
+  "build-mali-firmware.py",
+  "build-opi5plus-drivers.py Mali",
+]
+
+[device_tree]
+source = "device:dts/opi5plus.dts"
+include_dirs = ["soc:dts"]
+
+[components]
+include = ["ArmDTPlatform", "ArmCpu", "SoftwareAES", "GopFramebuffer", "AppleKeyStoreState", "XnuPrelink", "DarwinBoot"]
+
+[payload]
+volume = "OPI5PLUSESP"
+# The kernel is 49 MiB and the GPU add-on 12 MiB; with the ADT, the trust cache, the toml and the Data seed
+# they come to about 71 MiB, so 96 leaves a margin. The Data seed is no longer a whole container: it is the
+# front of a 2048 MiB APFS container, 9330688 bytes, because everything mkapfs writes lies in that front and
+# NativeSd accepts a container larger than the seed it is handed (package/NativeSd/NativeSd.cpp,
+# "containerBytes < size"), zeroing the 64 MiB after it on the first format. A whole 64 MiB seed was what made
+# this 192 before, and that volume is only 64 MiB of filesystem. The UEFI reads this image through U-Boot
+# `load mmc` at about 4.8 MiB/s, so 96 MiB is about 20 s instead of 40 -- the board has no fastboot buffer.
+size_mib = 96
+loader = "firmware"
+title = "UniXNU Orange Pi 5 Plus"
+# Must equal the one contiguous range of dts/opi5plus.dts byte for byte (devicetree.py compares them and
+# refuses the payload otherwise). The board has 8 GiB, but not as one range: the vendor tree describes
+# 0x0020_0000 + 0xefe0_0000, 0x1_0000_0000 + 0x1_0000_0000 and 0x2_f000_0000 + 0x1000_0000. The DTS comment
+# records which range this port declares (the 4 GiB one above 4 GiB) and why. This is therefore NOT the
+# 8 GiB that plan.md's M2 table assumed.
+dram_size = "0x100000000"
+panic_screen = false
+# The OS profile's own list is the first entry. The second one covers the SystemOS cryptex of the owner
+# image. Both are inherited from the profile here; they are listed so that a rebuild does not silently
+# pick up a different set.
+trust_cache_sha256 = [
+  "7416ca4f8377146626bb284e2133c76bee6cb4e3ee0af5d648b186235a7323a7",
+  "3312e1caf9ab3162ac23ae616d48bea41a1577286922fc1bff35d47f90a4382a",
+]
+# Boot arguments. The command line is limited to 1000 bytes (DarwinBoot's 1024-byte buffer) and every
+# argument must match [A-Za-z0-9_.\-]+(=[A-Za-z0-9_.,/\-]+)? — payload.py checks both before the volume is
+# written.
+#
+# ONLY ARGUMENTS THAT SOMETHING IN THIS BUILD ACTUALLY READS ARE ENABLED. That rule is what makes this list
+# differ from the EVB10's 45 entries, and it is a deliberate choice for a repository whose every area is
+# `planned`: an argument nothing parses is not configuration, it is a comment that cannot be checked. Each
+# group below names the parser that reads it, verified by searching the shared repositories (see
+# evidence/m2/summary.md for the commands).
+#
+#   console   -v verbose; serial=1 keeps the console on the UART and clears the INPUT bit (serial=1 is
+#             SERIALMODE_OUTPUT alone, 0x01; the 0x02 that serial=3 added is SERIALMODE_INPUT), so
+#             serial_keyboard_init() in osfmk/console/serial_general.c:57 returns without starting
+#             serial_keyboard_poll and the receive FIFO is left to NativeSd's reset hook (Ctrl-], 0x1d, in
+#             package/NativeSd/NativeSd.cpp). Output is unaffected: the console is still the UART.
+#             debug=0x10014e lifts the serial-output lock and restarts after a panic instead of parking in
+#             KDP. Base XNU. serial@feb50000 is UART2 at 1.5 Mbaud, the same node and rate as the EVB10, so
+#             the EVB10's console group carries over.
+#   cpu       sheng-smp=1 and armcpu-self-ipi=1 are read by drivers/ArmCpu (ArmCpu.cpp: PE_parse_boot_argn
+#             "sheng-smp", "armcpu-self-ipi"); sched-slowcpus is the TUNABLE of the SoC patch
+#             rk3588-slow-cores.patch; cpumask counts logical CPUs and leaves the four Cortex-A76 cores
+#             (0..3, listed first in the DTS) plus the boot A55.
+#   loads     offline-apfs-load and offline-mobile-graphics-load are read by the base patch
+#             patches/xnu/offline-component-load-probes.patch (the same patch also reads
+#             offline-legacy-register, which is disabled below because nothing links a display yet).
+#   security  sheng-no-lc=1 is read by the base (arch) series patch
+#             patches/xnu/zzyc-owner-skip-launch-constraints.patch, at the head of
+#             mac_proc_check_launch_constraints() in security/mac_process.c: the early return sits before
+#             MAC_POLICY_ITERATE, so AMFI's mpo_proc_check_launch_constraints hook never runs. Without it
+#             the owner-trusted stand-in for /usr/libexec/mobileactivationd is killed for a launch-constraint
+#             violation before it runs (evidence/m7/M7-10).
+kernel_args = [
+  "-v",
+  "serial=1",
+  "debug=0x10014e",
+  "sheng-smp=1",
+  "armcpu-self-ipi=1",
+  "armcpu-mmio-sgi=0",
+  "cpumask=31",
+  "sched-slowcpus=240",
+  "offline-apfs-load=1",
+  "offline-mobile-graphics-load=1",
+  # --- Data volume: the first-boot seed of patches/xnu/0002 ------------------------------------------
+  # sd-data-seed=1 lets bsd/kern/kern_exec.c seed the Data volume once per volume: the OS volume's
+  # /private/var tree, the runtime directories (keybags, mobile, mobile/tmp, tmp, run), the container
+  # tree and the five preference plists that skip the Setup assistant (opi5plus_seed_tree,
+  # opi5plus_seed_prefs_write). The argument is read in opi5plus_userland_prepare() by
+  # PE_parse_boot_argn. sd-data-seed=0 turns the seeding off and leaves the volume as the mount left
+  # it, which is the way back if the seed itself is what a boot trips over. The MobileGestalt cache
+  # wipe that runs next to it is not switched, because it is three unlinks of files that are rewritten
+  # on the next query (opi5plus_wipe_mobilegestalt).
+  "sd-data-seed=1",
+  # --- security: the launch-constraint escape for owner-trusted binaries -----------------------------
+  # Parser as in the header. The stand-in payload script (tools/wsl/tmp-payload-stub.sh) also passes this
+  # argument; payload.py replaces the board's entry with a --kernel-arg of the same name, so the two paths
+  # produce one argument, not two.
+  "sheng-no-lc=1",
+  # --- diagnostics: the sampler's boot arguments, one experiment at a time ----------------------------
+  # patches/xnu/0004-thread-sample.patch reads these: opi5plus-bt / -bt2 ... -bt8 (eight slots, 16
+  # characters each, because PE_parse_boot_argn copies max_len - 1 into a 17-byte buffer) in
+  # opi5plus_bt_wanted(), and opi5plus-bt-secs in opi5plus_ps_thread() of bsd/kern/kern_exec.c.
+  # They stay commented out because they name the processes of one experiment at a time, and the
+  # throw-away payload script that runs that experiment passes them: payload.py drops the board
+  # argument whose name a --kernel-arg repeats (scripts/unixnu/payload.py:93-96), so the two paths
+  # cannot produce a duplicate. tools/wsl/tmp-payload-stub.sh passes slots 1-4 today (SpringBoard,
+  # backboardd, mobileactivation, chronod); slots 5-8 are free.
+  # "opi5plus-bt=SpringBoard",
+  # "opi5plus-bt2=backboardd",
+  # "opi5plus-bt3=mobileactivation",
+  # "opi5plus-bt4=chronod",
+  # "opi5plus-bt-secs=30",
+  # --- display: switched on with the presenter at M5 ------------------------------------------------
+  # drivers/GopFramebuffer/NativeLegacyDisplay.cpp parses these, and the archive joins the kernel through
+  # CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y in configs/opi5plus_defconfig (currently `n`, because no build script
+  # produces the archive for this board). Enabling the arguments without the archive changes nothing.
+  # "offline-legacy-register=1",
+  # "offline-legacy-phase=4",
+  # "offline-legacy-gop=1",
+  # "offline-legacy-pm=1",
+  # "offline-legacy-validate=1",
+  # "offline-legacy-transfer=1",
+  # "offline-legacy-cpu-present=1",
+  # "sheng-vsync=60",
+  # --- console mirror: needs a board patch this repository does not have yet --------------------------
+  # vc_mirror is not a base XNU argument: the EVB10 gets it from its own patches/xnu/evb10-vc-mirror.patch
+  # (osfmk/console/serial_console.c, pexpert/arm/pe_init.c). This repository's patches/xnu/series is empty
+  # until M3, so the argument is inert here and stays off.
+  # "vc_mirror=1",
+  # --- keystore: the owned AppleKeyStore probe, in this repository ------------------------------------
+  # sheng-aks and offline-key-events are parsed by package/KeyStoreProbe.cpp: native_aks_state_enabled()
+  # reads sheng-aks (:31) and native_keyevents_probe() reads offline-key-events (:78), which then refuses
+  # to run unless the /chosen property ephemeral-storage is 1 or sheng-aks is 1 (:92) and no AppleKeyStore
+  # metaclass exists yet (:94). With both on, the probe attaches its own AppleKeyStore IOService (:105-117)
+  # over the resource service. That is what MKBEventsRegister() needs: without an AppleKeyStore service it
+  # answers NULL, SessionSyncEngine.Keybag's singleton initialiser takes the cbz on that NULL and brk #1s,
+  # so liveactivitiesd -- the carrier of com.apple.activitykit (BSService domain com.apple.activitykit,
+  # mach name com.apple.sessionservices) -- dies on every start, chronod's synchronous XPC to it never
+  # returns, and SpringBoard waits there instead of drawing. The service class is the catalog component
+  # AppleKeyStoreState (drivers/AppleKeyStoreState/NativeKeyStoreEvents.cpp in the UniXNU checkout, listed
+  # in [components] include and as component:AppleKeyStoreState in [kernel] scripts above); KeyStoreProbe.cpp
+  # binds its static initialiser as __GLOBAL__sub_I_NativeKeyStoreEvents.cpp (:12).
+  # The cost, accepted: this key store has no SEP and no passcode. The lock state it reports is an answer,
+  # not a state (sheng-aks-sls, default 0 = unlocked, 3 = MobileKeyBag's "no passcode"), and every real
+  # keybag operation fails against it.
+  "sheng-aks=1",
+  "offline-key-events=1",
+  # sheng-touch-hid stays out of this list because there is no touch panel on this board, not because the
+  # argument is an EVB10 leftover: this repository's package/Opi5plusHid/NativeHidInput.cpp parses it, and it
+  # alone decides whether the merged report descriptor carries the digitizer collection (with report ID 3).
+  # The round-3 injector switches that collection on by itself, so the payload script selects it with the value
+  # of opi5-hid-input instead of a new name here: 1 builds the device only, 2 and above also starts the
+  # synthetic report injector (package/Opi5plusHidProbe.cpp parses the value; evb10-hid-input is its alias).
+  # Input on this board is scripted injection and then USB HID.
+  # --- GPU: the Mali-G610 (M7 in plan.md, M4 in the reference port's docs) --------------------------
+  # mali=<milestone> is parsed in package/Mali/Mali.cpp: 1 power and GPU_ID, 2 firmware and MCU,
+  # 3 command stream, 6/7 several groups, 8 the IOKit service with its user client. The archive is now
+  # built (build-mali-firmware.py + build-opi5plus-drivers.py Mali) and force-loaded by
+  # configs/opi5plus_display_defconfig.
+  "mali=8",
+  # mali-metal=1 lets the driver serve the Metal plug-in: the bundle arrives through the GPU add-on and
+  # patch 0003 mounts it over /System/Library/Extensions. The add-on itself is switched by sd-gpu-addon,
+  # on by default when the payload carries one; the CoreAnimation properties it writes are switched by
+  # sd-gpu-prefs (also on by default). Both are read in patches/xnu/0003-gpu-addon.patch.
+  "mali-metal=1",
+  # "mali-pll=1",
+  # "mali-div=1",
+  # "mali-ycbcr-filter=device",
+  # "mali-aflush=1",
+  # "mali-epri=50",
+  # --- dropped outright, not deferred ----------------------------------------------------------------
+  # emmc=* / emmc-root-trust / emmc-systemos-union / emmc-data-*: read by the Rk3588Emmc driver and its
+  #   binding script, and this board has no eMMC. When the module arrives these are Plan A (see [userdata]).
+  # evb10-vop* / evb10-fb-*: the EVB10's VOP2 scan-out driver. This board's display is HDMI through the
+  #   firmware's GOP; a VOP2 fallback would get its own argument names, not the EVB10's.
+  # evb10-touch*: the EVB10's DSI panel and its coordinate mapping, parsed by its package/Evb10Touch and
+  #   package/Evb10Hid, neither of which this repository has. There is no touch panel here.
+  # evb10-hid-input: not dropped - package/Opi5plusHidProbe.cpp accepts it as an alias of opi5-hid-input, and
+  #   package/Opi5plusHid is this repository's port of the EVB10 HID device.
+  # wdt-kick: searched for in UniXNU, UniXNU-rk3588-common and this repository; the only occurrence is the
+  #   EVB10's own board.toml comment. Nothing in the shared tree parses it.
+  # -enable_kprintf_spam: carried by the EVB10, but its parser is not in any repository checked in here
+  #   (the XNU refer is fetched, not vendored), so it is left out until M3 can confirm it.
+]
+
+[payload.adt]
+# The OS profile's identity is iPad7,1 / j120ap / chip 0x8011; the ADT chip-id is the platform seed's low
+# half and stays the same as on the EVB10 (RK3588).
+chip_id = "0x1"
+# "required" makes the payload step refuse to run without --unique-chip-id HEX. The seed is not stored in
+# any repository (porting.toml area `configuration`).
+unique_chip_id = "required"
+# The memory the kernel owns: DarwinBoot takes this many contiguous bytes from the UEFI memory map.
+#
+# R2a experiment (2026-11-09): raised from 0x80000000 (2 GiB) to 0xF8000000 (3.875 GiB, the value the
+# reference port boots) to read DarwinBoot's own window diagnostics. 2 GiB was chosen for a 32-bit DMA
+# reason that does not hold: package/SdHost is PIO only ("DMA off", SdHost.h:19-22 and :529), and it is the
+# only block device on this board. If no run is long enough DarwinBoot draws "NO WINDOW ... BIG RUN ..." and
+# the FREE lines on the frame buffer (DarwinBoot.c:440-446) and refuses the boot; the screen then holds the
+# answer to whether the upper 4 GiB bank is still split by the prebuilt Realtek UNDI driver.
+# Range accepted: 256 MiB to 8 GiB in 2 MiB steps.
+owned_memory_size = "0xF8000000"
+# The Data seed is a raw APFS container, so the ADT carries the RAMDisk placeholder, not the packed one.
+packed_data_ramdisk = false
+# The APFS volume inside the OS window of the root image, read out of the image itself
+# (tools/wsl/330-find-apfs-volume-uuid.py, anchored on newfs_apfs at apfs_superblock_t+280 and the UUID at
+# +240 of the block: 04 76 9d 26 2c a0 48 25 b4 43 e2 e5 f8 83 00 f2). Without it, IOFindBSDRoot falls
+# back to `IOMedia Content = Apple_HFS` (IOKitBSDInit.cpp:857-867), which no APFS volume ever matches, and
+# the boot dies in "Waiting on <dict ... Apple_HFS>" then "Failed to mount root device". With it,
+# devicetree.py writes /chosen/root-matching and the kernel matches the media by UUID instead.
+# Same value as UniXNU-evb10's: both ports mount the same iPadOS 17.7.11 21H461 OS volume.
+root_match_volume_uuid = "04769D26-2CA0-4825-B443-E2E5F88300F2"
+
+[adt]
+
+[adt.defaults]
+
+# sleep-disabled: suspend and resume are not implemented. vmm-present backs sysctl kern.hv_vmm_present, which
+# makes watchdogd (no hardware watchdog it could drive) exit cleanly. kern.maxvnodes comes from the OS profile.
+[adt.defaults.u32]
+sleep-disabled = 1
+vmm-present = 1
+
+[adt.product]
+
+# Read from /proc/device-tree/model on the board and from the compatible of board/current-opi5plus.dts.
+[adt.product.string]
+model = "xunlong,orangepi-5-plus"
+
+[adt.product.u32]
+thin-bezel = 1
+
+[adt.buttons]
+
+[adt.buttons.string]
+compatible = "buttons"
+device_type = "buttons"
+
+[adt.buttons.strings]
+button-names = ["hold", "voldown", "volup"]
+
+[adt.buttons.u32]
+home-button-type = 2

@@ -1,0 +1,46 @@
+# Build outputs and caches (re-derivable)
+/build/
+/out/
+/.cache/
+/refer/
+/.local*/
+
+# Local configuration: addresses, accounts and paths of the machines that build and run the board
+.env
+local.toml
+
+# Local development files
+*.log
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/
+__pycache__/
+*.pyc
+
+# Inputs, images and products that never belong in Git
+*.ipsw
+*.dmg
+*.im4p
+*.img
+*.macho
+*.o
+*.a
+*.dylib
+*.efi
+*.dtb
+*.bin
+*.pem
+*.key
+
+# Round-1 baseline additions.
+# Package build tree (generated output).
+/package/Build/
+# Mali is a checkout with its own .git and has no .gitmodules entry, so it must
+# never be recorded as an embedded repository.
+/package/Mali/
+
+# Editor/backup copies (evidence stash keeps *.bak-r* snapshots on disk).
+*.bak
+*.bak-*

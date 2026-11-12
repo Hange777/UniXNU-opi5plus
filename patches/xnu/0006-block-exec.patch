@@ -1,0 +1,90 @@
+Orange Pi 5 Plus: refuse to exec a daemon that cannot start, so launchd fails its XPC request
+instead of queueing it forever.
+
+SpringBoard's main thread blocks in -[SBLockdownManager lockdownState] -> -[MadGate getActivationState:]
+for the rest of the boot because mobileactivationd dies in its own main() error path and launchd keeps
+starting it on demand (evidence/m7/M7-08, M7-09). opi5plus-block-exec=mobileactivationd makes the exec
+fail with EPERM, so launchd answers the request with an error and the caller proceeds. The check is at
+both execve() and posix_spawn(): launchd starts jobs with the latter, which never reaches execve()
+(measured: an execve-only version never fired, and mobileactivationd still crashed 16 times).
+Off unless the argument names something.
+
+--- a/bsd/kern/kern_exec.c
++++ b/bsd/kern/kern_exec.c
+@@ -3590,6 +3590,16 @@
+ 		struct vnode_attr origva;
+ 	} *__spawn_data;
+ 
++#if DEVELOPMENT || DEBUG
++	{
++		extern int opi5plus_block_exec_path(user_addr_t);
++		int opi5plus_blocked = opi5plus_block_exec_path(uap->path);
++
++		if (opi5plus_blocked != 0) {
++			return opi5plus_blocked;
++		}
++	}
++#endif
+ 	/*
+ 	 * Allocate a big chunk for locals instead of using stack since these
+ 	 * structures are pretty big.
+@@ -5127,6 +5137,12 @@
+ #if DEVELOPMENT || DEBUG
+ 	{
+ 		extern int opi5plus_trace_exec(proc_t, struct execve_args *);
++		extern int opi5plus_block_exec_path(user_addr_t);
++		int opi5plus_blocked = opi5plus_block_exec_path(uap->fname);
++
++		if (opi5plus_blocked != 0) {
++			return opi5plus_blocked;
++		}
+ 		(void)opi5plus_trace_exec(p, uap);
+ 	}
+ #endif
+@@ -10274,4 +10290,46 @@
+ 		opi5plus_exit_dropped = 0;
+ 	}
+ }
++/*
++ * Orange Pi 5 Plus: refuse to exec a named program.
++ *
++ * A daemon that cannot start still holds the launchd job that backs its XPC service, and launchd answers a
++ * request for that service by starting the job: SpringBoard's synchronous -[MadGate getActivationState:] then
++ * waits for a reply that never comes, for the rest of the boot (evidence/m7/M7-08). mobileactivationd is the
++ * case this exists for -- it dies by design in its own main() error path (evidence/m7/M7-09) -- and refusing
++ * the exec makes launchd fail the request instead of queueing it, which is what lets the caller move on.
++ *
++ *	opi5plus-block-exec=mobileactivationd	comma separated, matched against the program's basename
++ *
++ * Two call sites, because launchd starts jobs with posix_spawn(2), which builds and executes the image
++ * inside the kernel and never reaches execve(): the check runs at the top of both. An experiment switch:
++ * nothing happens unless the argument is present.
++ */
++int
++opi5plus_block_exec_path(user_addr_t path_pointer)
++{
++	static char list[160];
++	static int ready = 0;
++	char path[128];
++	size_t length = 0;
++	const char *base;
++
++	if (!ready) {
++		ready = 1;
++		(void) PE_parse_boot_argn("opi5plus-block-exec", list, sizeof(list));
++	}
++	if (list[0] == 0) {
++		return 0;
++	}
++	if (copyinstr(path_pointer, path, sizeof(path), &length) != 0 || length == 0) {
++		return 0;
++	}
++	base = strrchr(path, '/');
++	base = (base != NULL) ? (base + 1) : path;
++	if (base[0] == 0 || strnstr(list, base, sizeof(list)) == NULL) {
++		return 0;
++	}
++	printf("opi5plus: exec of %s blocked (opi5plus-block-exec=%s)\n", path, list);
++	return EPERM;
++}
+ #endif /* DEVELOPMENT || DEBUG */
