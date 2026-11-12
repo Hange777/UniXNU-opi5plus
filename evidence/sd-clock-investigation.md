@@ -116,6 +116,47 @@ records a build identity but not a reproducible one. **Judge a kernel by the sha
 "it should be the same build"** — two rebuilds of one source are two kernels as far as evidence goes. The
 before-hash line of a build log (`logs/build-round10.log:3`) is the previous kernel, not the one being built.
 
+### S6a — what actually differs (2026-11-12 experiment)
+
+Two consecutive incremental builds (`tools/wsl/build-kernel.sh 1|2`, three-residue cleanup each time, with
+`SOURCE_DATE_EPOCH` pinned to the last device-repo commit) produced
+`d6861991475156dc1d114b127d65ff7ba4c96bbc5f2a2ed2ec7615b6b334bd53` and
+`8c0ae9c0d2fcff73128ca569211631e992c71a0c4ae473fad372707b8a0ad2d2`. Byte-level diff: 393 differing regions,
+12,229 bytes, and **392 of the 393 regions are inside `__LINKEDIT`** — every one is the `n_value` of an
+`N_OSO` stab (`n_type 0x66`, name = the linked object's full path) plus one 22-byte diff in `__PRELINK_INFO`:
+
+1. **N_OSO mtimes (969 in one build).** ld64 stamps each linked object path into the symbol table with the
+   object file's mtime as its value. Incremental rebuilds rewrite some `.o` files, so the stamps move with
+   wall-clock time. `SOURCE_DATE_EPOCH` does not reach them (the timestamps also sit in the prelink *input*
+   `mach.development.bcm2837.unstripped.noctf`, i.e. they come from the XNU link, not the prelink).
+2. **`_PrelinkKCID` (1 × 16 B, base64).** `kits/XnuPrelink/emit_prelink.py:269` derives it as
+   `sha256(kernel + original kernelcache)[:16]`, so it changes whenever any N_OSO byte changes.
+3. **LC_UUID** — zeroed by the mask here; the identifier of the image.
+
+A deterministic byte-reproducible build would need the `.o` mtimes clamped to a fixed epoch before the final
+XNU link (then the KCID follows), which costs two more build runs to verify — out of budget for this
+experiment, so it stays a recommendation, not a device-verified fact.
+
+### S6b — the working judge: `tools/wsl/compare-kernel.py`
+
+Semantic equivalence of two builds is directly decidable by masking exactly the classes above:
+
+```
+wsl.exe -d unixnu -u root -e bash -c \
+  'python3 /mnt/d/rk-mac/repos/UniXNU-opi5plus/tools/wsl/compare-kernel.py \
+   /opt/unixnu-out/opi5plus/ipados-17.7.11-21H461/opi5plus_display/kernel/kernel.macho.1 \
+   /opt/unixnu-out/opi5plus/ipados-17.7.11-21H461/opi5plus_display/kernel/kernel.macho.2'
+```
+
+On the two experiment builds it reports **SEMANTICALLY EQUIVALENT**
+(normalized sha256 `4fe69551b1d9014f8047f7056db48895f71a6ed5788eec0a14924863dd3b3104`; masked: 1 LC_UUID,
+969 N_OSO values, 1 `_PrelinkKCID`). A deliberately corrupted code byte makes it report NOT EQUIVALENT with
+the offset listed (exit 1), so the judge separates metadata churn from real content. Builds are still run
+with `tools/wsl/build-kernel.sh <run-id>`, which cleans the three known incremental-build residues first
+(`startup.o.json` moved to `tree/logs/`, xnu-work `startup.c` touched, the regenerated bsd `Makefile`
+deleted) and keeps `kernel.macho.<run-id>` for comparison; note its log always shows one `error:` line — the
+bootstrap pass fails by design at the link (scripts/unixnu/kernel.py:176) and is not a build failure.
+
 ## R1 — captures
 
 | log | size | first beat line |
