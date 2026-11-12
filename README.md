@@ -26,10 +26,14 @@ next 2x is CRU clock-tree work (move the sdmmc source clock to 52 MHz), not driv
 ([`evidence/sd-clock-investigation.md`](evidence/sd-clock-investigation.md),
 [`evidence/round4-6-result.md`](evidence/round4-6-result.md)). The board also resets itself back to Linux now:
 `tools/wsl/serial-reset.py` sends Ctrl-] over COM3 and NativeSd's UART hook panics on it — about 19 s later the
-board is back in Linux (`serial=1` gives the hook the receive FIFO, closing serial input). The next real
-problem is memory exhaustion over a long run: the round-2 run ended at 6,180 free pages (~24 MB) at t+3600, and
-round 3's full run bottoms at 1,440 free pages (~5.6 MB) at t+2825 with the SD read side stalled at the same
-time.
+board is back in Linux (`serial=1` gives the hook the receive FIFO, closing serial input). Memory is not the next wall: the low
+`vfree` readings of the long runs (6,180 pages ≈24 MB at t+3600 in round 2; 1,440 pages ≈5.6 MB at t+2825 in
+round 3) are XNU's designed steady state, not a pathology — reclamation runs off the speculative/inactive
+queues and free + speculative memory never dropped below ~0.92 GB in any long run; the VM compressor is
+compiled in mode 8 (freezer semantics, hence `vcomp 0`, switchable with the boot argument `vm_compressor=2`,
+zero kernel code), and jetsam correctly finds nothing to kill. The next step on this line is observation, not
+a fix: extend the beat line with `vext/vpur/vinact/vact/vcact/vcmode/lsr` to build the jetsam/compressor
+baseline.
 `porting.toml`
 marks firmware, cpu, memory, storage and display `implemented` and input `device-verified`; round 3's measurement is
 [`evidence/round3-result.md`](evidence/round3-result.md), round 2's baseline and root cause is

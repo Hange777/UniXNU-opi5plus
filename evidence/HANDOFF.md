@@ -68,16 +68,33 @@ Rounds 4-10 (2026-11-12) then measured and closed the two things that were cheap
 3. **`vsync sent=0 arms=0`** in every vsync line of both rounds, so swaps complete without the userland ever
    arming a vsync — and round 3 unlocked the device the same way. Next: find the caller that arms one, and
    whether the compositor waits at all for a static UI.
-4. **Memory exhaustion over a long run is the next real problem.** The rounds 4-10 windows are short (100-505 s
-   of kernel time), but the long runs end with the free list gone: the round-2 run ended at 6,180 free pages
-   (about 24 MB) at t+3600, and round 3's full 3,600 s run is worse — the free list sits in the low thousands
-   of pages after t+2000 and bottoms at **1,440 pages (about 5.6 MB) at t+2825** (`logs/boot-round3.log:21020`,
-   `vfree 1440`), and the SD read side stalls at the same time: blocks sit at 38,641,792 for the 40 s from
-   t+2740 to t+2780 (`logs/boot-round3.log:20305` first frozen beat, `vfree 3523`; `:20584` at t+2780,
-   `vfree 3363`) and then only crawl afterwards. "The reads stop because nobody is left to ask" holds in both
-   runs: 254 processes fitted and nothing can serve a client that asks for a large buffer (`porting.toml` area
-   `memory`, limits). Any round that wants to run for hours — or to add frame-rate or GPU-pool work on top —
-   has to answer where the memory goes before anything else.
+4. **Memory — the earlier "exhaustion" reading was wrong; what remains here is observation, not a fix.** The
+   low `vfree` numbers are XNU's designed steady state, not a pathology: reclamation runs off the
+   speculative/inactive queues, and free + speculative together never dropped below about 0.92 GB in any of
+   the three long runs (round 1 ends at 2.03 GB; round 2 bottoms near 0.92 GB — `vfree 1111` at t+1710 with
+   `vspec` ~242,000 pages, `logs/boot-round2.log:9860`; round 3 ends at 1.30 GB, its true `vfree` floor is
+   1,131 pages at t+1860 during the read storm, `logs/boot-round3.log:12314`, while the 1,440 pages at
+   t+2825 (`:21020`) is only the floor of the window after the reads stalled). Round 2 shows the reclaim
+   loop live: between t+1775 and t+1785 the read storm takes `vspec` from 360,500 to 230,000 pages (~500 MB
+   of file cache recycled), after which `vfree` bounces back to ~10,000 pages (the frozen read beats sit
+   near `logs/boot-round2.log:26438`). The VM compressor is not missing either: this kernel prints
+   `"vm_compressor_mode" is 8` (`logs/boot-round1.log:1613`) with the 4,608 MB pool mapped (`:1591`); mode 8
+   has freezer semantics — `compressor_is_active` is FALSE (`osfmk/vm/vm_pageout.c:5050-5053`) so pageout
+   does no active compression (`:3700-3712`), the kernel's only compression path is the freezer
+   (`osfmk/vm/vm_object.c:7557-7567`), and it only freezes suspended processes of which the board has none —
+   hence `vcomp 0`. Switching it on is a boot argument, `vm_compressor=2` (`vm_pageout.c:5040-5044`), zero
+   kernel code. jetsam not killing anything is also correct: CONFIG_JETSAM is in
+   (`MASTER.arm64.bcm2837:63`), the available-memory reading includes the file cache
+   (`osfmk/vm/vm_page.h:1645-1652`), the pressure threshold is ~12% ≈490 MB (`kern_memorystatus.c:248`,
+   `:252-253`), the file cache stays far above it, and the three round logs hold zero `jetsam` /
+   `memorystatus` / SIGKILL lines. The SD read stalls are likewise independent of memory (85-90%
+   confidence): round 1 stopped reading with ~209,000 free pages (820 MB) still free, in all three rounds
+   the `vfree` collapse precedes the read stall by more than 1,000 s, block failures stay 0 throughout, and
+   successful read bursts still land during the stall (round 3, t+2785, +47,744 blocks) — the userland goes
+   quiet and nobody issues I/O any more. Next: extend the beat line with
+   `vext/vpur/vinact/vact/vcact/vcmode/lsr` (patch 0002's beat thread, `:1553-1625`, and the counter
+   functions in `osfmk/kern/debug.c`, `:1920-1930`) to build the jetsam/compressor baseline, then optionally
+   run a `vm_compressor=2` comparison boot.
 
 ## Key commands
 
