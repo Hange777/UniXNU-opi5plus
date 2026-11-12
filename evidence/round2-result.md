@@ -158,3 +158,33 @@ this kernel, so the kernel in the payload and the tree in this repository are th
 * It does not claim any daemon other than the three named ones is healthy: `fairplayd.A2` (319) and `maild` (234)
   also exit and respawn in this run, both with `code 0`, so they are cycling rather than failing.
 * It says nothing about frame rate: 54 frames over 3,600 s is a static UI, not a rate.
+
+## Verbatim log excerpts (added post-round-11 for evidence accessibility)
+
+Added in the post-commit review round: `logs/boot-round1.log` and `logs/boot-round2.log` live only in
+the project working tree (gitignored), so the lines the root-cause verdict and the round-1 exit counts
+rest on are copied here verbatim. Line numbers are 1-based counting only LF (`\n`), i.e. what ripgrep
+prints (both logs are CRLF with occasional stray CRs from serial interleaving).
+
+* Round 2, the `stat` probe's owner lines (excerpted verbatim from `logs/boot-round2.log`, sha256
+  `1308f124c9736c1cbb6b75a29c0346fed1df83cac91777633cca76836e8cb754`, 3,522,343 B; original lines
+  1930-1933. The block quoted above in this page is the same five readings aligned with extra spaces
+  for readability; these are the bytes the log carries):
+
+```
+opi5plus: stat /private/var/mobile rc 0 uid 501 gid 501 mode 040755
+opi5plus: stat /private/var/mobile/Library rc 0 uid 501 gid 501 mode 040755
+opi5plus: stat /private/var/mobile/tmp rc 0 uid 501 gid 501 mode 040755
+opi5plus: stat /private/var/tmp rc 0 uid 0 gid 0 mode 041777
+```
+
+* Round 1, one sample of each daemon's 10 s exit loop (excerpted verbatim from `logs/boot-round1.log`,
+  sha256 `0fdaa22fdddb584f42594f67aa20752d1fbd1664600162990b48b217e017b207`, 12,447,103 B; the three
+  daemons total 243 + 266 + 280 `code 1` lines — `callservicesd`, `nsurlsessiond`, `biomed` — of which
+  one each, original lines 3349, 3350 and 4078):
+
+```
+opi5plus: exit biomed[204] rv 0x100 sig 0 code 1 age 2
+opi5plus: exit nsurlsessiond[205] rv 0x100 sig 0 code 1 age 1
+opi5plus: exit callservicesd[339] rv 0x100 sig 0 code 1 age 3
+```

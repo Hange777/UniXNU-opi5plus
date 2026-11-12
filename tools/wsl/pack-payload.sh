@@ -8,25 +8,43 @@
 # carry. The merge rule is scripts/unixnu/payload.py:93-96 -- a board entry whose name a --kernel-arg
 # repeats is dropped -- and with no --kernel-arg at all it cannot bite.
 #
-# Usage: run as root in the WSL distro, from /mnt/d/rk-mac/repos/UniXNU (same environment as the
-# round scripts):   bash /mnt/d/rk-mac/repos/UniXNU-opi5plus/tools/wsl/pack-payload.sh [OUTPUT.img]
-# Output: $1, default /mnt/d/rk-mac/artifacts/m5/payload.img. Log: /tmp/pack-payload.log.
+# Usage: run as root in the WSL distro, from $RK_MAC/repos/UniXNU (same environment as the
+# round scripts):   bash "$RK_MAC/repos/UniXNU-opi5plus/tools/wsl/pack-payload.sh" [OUTPUT.img]
+# Output: $1, default $RK_MAC/artifacts/m5/payload.img. Log: /tmp/pack-payload.log.
 # The build step is NOT run here: it needs a fresh kernel.macho under $OUT/kernel/ (build it with
 # ./unixnu defconfig opi5plus_display_defconfig -D ../UniXNU-opi5plus && ./unixnu build kernel).
+#
+# UNIXNU_UNIQUE_CHIP_ID, RK_MAC and GIT_PROXY are read from the gitignored $RK_MAC/.env (KEY=VALUE;
+# see the root .env.example) and the script refuses to run without them, so no host-specific value is
+# hardcoded here.
 set -u
-OUT_ARG="${1:-/mnt/d/rk-mac/artifacts/m5/payload.img}"
+
+ENV_FILE=${UNIXNU_ENV_FILE:-/mnt/d/rk-mac/.env}
+if [ ! -f "$ENV_FILE" ]; then
+  echo "error: no .env at $ENV_FILE (copy the root .env.example to .env and fill it in)" >&2
+  exit 1
+fi
+set -a
+. "$ENV_FILE"
+set +a
+: "${UNIXNU_UNIQUE_CHIP_ID:?set UNIXNU_UNIQUE_CHIP_ID in .env}"
+: "${RK_MAC:?set RK_MAC in .env}"
+: "${GIT_PROXY:?set GIT_PROXY in .env}"
+
+OUT_ARG="${1:-$RK_MAC/artifacts/m5/payload.img}"
 LOG=/tmp/pack-payload.log
 export UNIXNU_OUT=/opt/unixnu-out
-export UNIXNU_UNIQUE_CHIP_ID=4f504935504c5553
-DEV=/mnt/d/rk-mac/repos/UniXNU-opi5plus
+export UNIXNU_UNIQUE_CHIP_ID
+export http_proxy="$GIT_PROXY" https_proxy="$GIT_PROXY"
+DEV=$RK_MAC/repos/UniXNU-opi5plus
 OUT=/opt/unixnu-out/opi5plus/ipados-17.7.11-21H461/opi5plus_display
-UNIXNU=/mnt/d/rk-mac/repos/UniXNU/unixnu
-ADDON=/mnt/d/rk-mac/.tmp/native-plus-stub.addon
-cd /mnt/d/rk-mac/repos/UniXNU || exit 1
+UNIXNU=$RK_MAC/repos/UniXNU/unixnu
+ADDON=$RK_MAC/.tmp/native-plus-stub.addon
+cd $RK_MAC/repos/UniXNU || exit 1
 [ -f "$ADDON" ] || { echo "error: no addon at $ADDON (run make-exec-stub-addon.py)"; exit 1; }
 $UNIXNU payload -D $DEV --out $OUT --kernel $OUT/kernel/kernel.macho \
   --owner-trust-cache "$DEV/.cache/gpu-trust.bundle" --gpu-addon "$ADDON" \
-  --data-ramdisk /mnt/d/rk-mac/artifacts/m3/data-seed-front2g.img \
+  --data-ramdisk $RK_MAC/artifacts/m3/data-seed-front2g.img \
   > "$LOG" 2>&1
 echo "rc=$?"
 tail -4 "$LOG"

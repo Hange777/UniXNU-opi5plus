@@ -255,7 +255,7 @@ index 8a1ec42..72683eb 100644
 +}
 +#endif /* DEVELOPMENT || DEBUG */
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 8bba078..b57a797 100644
+index 8bba078..b26061a 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -5121,6 +5121,12 @@ proc_exec_switch_task(proc_t old_proc, proc_t new_proc, task_t old_task, task_t
@@ -286,7 +286,7 @@ index 8bba078..b57a797 100644
  
  	/*
  	 * Copy out program name.
-@@ -8055,3 +8069,1628 @@ sysctl_libmalloc_experiments SYSCTL_HANDLER_ARGS
+@@ -8055,3 +8069,1630 @@ sysctl_libmalloc_experiments SYSCTL_HANDLER_ARGS
  }
  
  EXPERIMENT_FACTOR_PROC(_kern, libmalloc_experiments, CTLTYPE_QUAD | CTLFLAG_RW, 0, 0, &sysctl_libmalloc_experiments, "A", "");
@@ -1652,8 +1652,8 @@ index 8bba078..b57a797 100644
 +				opi5plus_pe_number((unsigned long long)statfs->f_bavail);
 +			}
 +		}
-+		/* lsr: seconds since the last successful SD read, separating "nobody has asked the card for a block"
-+		 * from "a read was issued and has not come back" (a 0 means no read has completed yet). The tick is
++		/* lsr: seconds since the last successful SD read; "-" means no read has ever completed (the tick
++		 * is still 0), and a 0 means the last read finished less than a second ago. The tick is
 +		 * the one NativeSd writes on its readBlocks success path, and this reads the same counter (cntpct_el0)
 +		 * the driver times its chunk reads with; cntfrq_el0 is that counter's frequency. */
 +		{
@@ -1665,7 +1665,9 @@ index 8bba078..b57a797 100644
 +			__asm__ volatile("isb\n\tmrs %0, cntfrq_el0" : "=r"(lsr_tick_freq));
 +			opi5plus_pe_puts(", lsr ");
 +			if (lsr_last_tick == 0 || lsr_tick_freq == 0) {
-+				opi5plus_pe_puts("0");
++				/* pe_puts, not printf: the beat thread's printf wedges against the console (see the
++				 * comment above the watchdog kick), and every field on this line uses the pe_ writers. */
++				opi5plus_pe_puts("-");
 +			} else {
 +				opi5plus_pe_number((lsr_now_tick - lsr_last_tick) / lsr_tick_freq);
 +			}

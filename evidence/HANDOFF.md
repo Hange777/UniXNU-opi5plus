@@ -73,16 +73,27 @@ Round 11 (2026-11-12) then made direct scanout the working display path:
    the firmware has USB and nothing about XNU; and `IOHIDSystem` is not a class of this kernel at all
    (`evidence/m5/M5-08`), so its `absent` reading carries no information. Next: make the prelink feasibility
    decision for the USB host stack (17 kexts, closure 29) before scheduling it as work.
-2. **White blocks — the banding is closed, this one is separate.** Round 11 **closed the banding inside the
-   large glyphs**: with `opi5-gop-mirror=0` it is gone, and the early-boot stripes (the Apple-logo phase) plus
-   the mirror copy plus the early paints are one mechanism — CPU writes into the (write-combining) scanout
-   buffer the VOP is concurrently scanning (the early console's own buffer is the scanout buffer,
-   `logs/boot-round11.log:1936` base 0xE6740000 = Esmart2). Direct scanout removes every producer; verdict
-   in `evidence/round11-result.md` S7. The **white blocks (three white rounded rectangles) remain** and are
+2. **White blocks — the banding is closed as a phenomenon, this one is separate.** Round 11 closed the
+   banding inside the large glyphs: with `opi5-gop-mirror=0` it is gone, and the early-boot stripes
+   (the Apple-logo phase), the mirror copy and the early paints share the producers — CPU writes into
+   the buffer the VOP is concurrently scanning (the early console's own buffer is the scanout buffer,
+   `logs/boot-round11.log:1936` base 0xE6740000 = Esmart2). The banding is **avoided by direct scanout
+   (confirmed)**; the mapping-attribute audit (`evidence/round11-result.md` S7) found every kernel
+   mapping that can write a scanout buffer non-cacheable (bootMapping maps Device nGnRnE via
+   `kIOMapInhibitCache`, the frame buffer lies outside the ADT DRAM window, each kernel write is
+   followed by `dsb sy`), so the write-combining and dirty-cache candidates are eliminated; what
+   remains is conjecture — scanout racing unsynchronized CPU writes into the live buffer (the early
+   console's writer is the firmware's DarwinBoot diagnostic console, whose UEFI mapping attributes are
+   not visible here). The
+   **white blocks (three white rounded rectangles) remain** and are
    independent of the banding — the round-11 run split them off. They point at WidgetRenderer rendering an
    empty surface; that is the next display-line target.
-   One pending follow-up on the round-11 state: name the vop-direct teardown branch behind the single
-   t+1595 `back to boot 1` (a transient during unlock session teardown, fallbacks 0, no criterion broken).
+   Resolved by source read: the single t+1595 `back to boot 1` is the designed blank-swap path —
+   `kickOnce()`'s `surface == nullptr` branch paints the boot buffer black (`directToBoot()` ->
+   `flip(bootIova)` -> `fill_pixels 0xff000000`) while the unlock session is torn down and rebuilt, and
+   the next surface swap flips back; one occurrence because blank swaps only happen at session
+   transitions; not a copy fallback (fallbacks 0 throughout); why IOMFB issues a blank swap at teardown
+   is not answerable from our logs.
 3. **`vsync sent=0 arms=0`** in every vsync line of both rounds, so swaps complete without the userland ever
    arming a vsync — and round 3 unlocked the device the same way. Next: find the caller that arms one, and
    whether the compositor waits at all for a static UI.
@@ -125,6 +136,10 @@ export http_proxy=http://$GW:7980 https_proxy=http://$GW:7980   # GW = ip route 
 UNIXNU_OUT=/opt/unixnu-out ./unixnu defconfig opi5plus_display_defconfig -D ../UniXNU-opi5plus
 UNIXNU_OUT=/opt/unixnu-out UNIXNU_UNIQUE_CHIP_ID=4f504935504c5553 ./unixnu build kernel -D ../UniXNU-opi5plus
 ```
+
+(That is the historical manual form. The two `tools/wsl/` harness scripts now read these values from
+the gitignored `/mnt/d/rk-mac/.env` — `UNIXNU_UNIQUE_CHIP_ID`, `RK_MAC`, `GIT_PROXY` — and refuse to
+run without them, so no host-specific value is hardcoded in the scripts.)
 
 Payload: since round 11 the regular pack is `tools/wsl/pack-payload.sh` — run as root in the WSL distro from
 `/mnt/d/rk-mac/repos/UniXNU`, `bash /mnt/d/rk-mac/repos/UniXNU-opi5plus/tools/wsl/pack-payload.sh

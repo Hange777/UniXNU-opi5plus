@@ -40,13 +40,15 @@ line now carries the seven fields (`vcmode 8` / `vcact 0` is the compressor base
 **`opi5-gop-mirror=0` made direct scanout the working display path** — zero-copy (`gop 0/158`, every swap
 `0 copies`, no `gop blit` anywhere), the 30 s readback saying `window on a compositor surface` every time it
 prints, latch mean ~14 ms / longest 17.1 ms / 0 over 50 ms, and the board's first frame-rate measurement:
-**50 fps** during the unlock animation. The banding question closed with it — its root cause is CPU writes
-into the (write-combining) scanout buffer (the mirror copy, the early console's writes and the early paints
-are one mechanism; direct scanout removes every producer,
+**50 fps** during the unlock animation. The banding question closed as a phenomenon with it — it is
+avoided by direct scanout, and its producers are CPU writes into the buffer the VOP scans (the mirror
+copy, the early console's writes and the early paints; the mapping-attribute audit eliminated the
+write-combining and dirty-cache candidates for kernel writers, leaving the scanout racing
+unsynchronized CPU writes as the remaining conjecture,
 [`evidence/round11-result.md`](evidence/round11-result.md)) — while the **white blocks remain and are a
 separate defect** (WidgetRenderer rendering an empty surface, the next display-line target).
 `porting.toml`
-marks firmware, cpu, memory, storage and display `implemented` and input `device-verified`; round 3's measurement is
+marks firmware, cpu and memory `implemented`, and storage, display and input `device-verified`; round 3's measurement is
 [`evidence/round3-result.md`](evidence/round3-result.md), round 2's baseline and root cause is
 [`evidence/round2-result.md`](evidence/round2-result.md), round 11's direct-scanout verification is
 [`evidence/round11-result.md`](evidence/round11-result.md), round 3's build identity is in
@@ -80,7 +82,7 @@ This is the whole point of the repository; the UniXNU machinery is identical.
 | Path | Contents |
 | --- | --- |
 | `board.toml`, `feeds.toml` | Board configuration and the pinned SoC source |
-| `porting.toml` | Porting record: 14 areas, six of them `implemented` and `input` `device-verified`, with the findings gathered so far |
+| `porting.toml` | Porting record: 14 areas, four of them `implemented` and storage, display and input `device-verified`, with the findings gathered so far |
 | `configs/opi5plus_defconfig`, `configs/opi5plus_display_defconfig` | The two kernel configurations |
 | `dts/opi5plus.dts` | Board device tree on the shared `rk3588.dtsi` |
 | `package/` | Board drivers: `NativeSd` (storage), `NativeLegacyDisplay` + `LegacyDisplayProbe` (display), `NativeHidInput` (input) |

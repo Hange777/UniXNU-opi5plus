@@ -15,8 +15,8 @@
 #      c. deletes the regenerated bsd/DEVELOPMENT/Makefile that points SRCROOT
 #         at osfmk and breaks the bsd pass,
 #   3. runs `unixnu defconfig opi5plus_display_defconfig` and `unixnu build kernel`
-#      with the environment the other build scripts use (proxy via the default
-#      gateway, UNIXNU_UNIQUE_CHIP_ID platform seed),
+#      with the environment the other build scripts use (proxy via GIT_PROXY from
+#      .env, UNIXNU_UNIQUE_CHIP_ID platform seed),
 #   4. keeps a copy of the linked kernel as kernel/macho kernel.macho.<run-id>
 #      next to the real output and prints its sha256, so two runs can be compared.
 #
@@ -29,9 +29,23 @@
 # _PrelinkKCID; judge two builds with tools/wsl/compare-kernel.py instead.
 set -u
 
+# Host paths, the platform seed and the git proxy come from the gitignored .env at the root of
+# RK_MAC (KEY=VALUE; see the root .env.example); the script refuses to run without them, so no
+# host-specific value is hardcoded here.
+ENV_FILE=${UNIXNU_ENV_FILE:-/mnt/d/rk-mac/.env}
+if [ ! -f "$ENV_FILE" ]; then
+  echo "build-kernel: no .env at $ENV_FILE (copy the root .env.example to .env and fill it in)" >&2
+  exit 1
+fi
+set -a
+. "$ENV_FILE"
+set +a
+: "${UNIXNU_UNIQUE_CHIP_ID:?set UNIXNU_UNIQUE_CHIP_ID in .env}"
+: "${RK_MAC:?set RK_MAC in .env}"
+: "${GIT_PROXY:?set GIT_PROXY in .env}"
+
 RUN_ID=${1:?usage: build-kernel.sh RUN_ID}
-ROOT=$(cd "$(dirname "$0")/../../.." && pwd)/..
-ROOT=$(cd "$ROOT" && pwd)
+ROOT=$RK_MAC
 DEV="$ROOT/repos/UniXNU-opi5plus"
 XNU="$ROOT/repos/UniXNU"
 OUT=${UNIXNU_OUT:-/opt/unixnu-out}
@@ -41,12 +55,9 @@ OBJ=$W/build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837
 LOG="$ROOT/logs/build-repro-$RUN_ID.log"
 
 export UNIXNU_OUT=$OUT
-export UNIXNU_UNIQUE_CHIP_ID=${UNIXNU_UNIQUE_CHIP_ID:-4f504935504c5553}
+export UNIXNU_UNIQUE_CHIP_ID
 export CCC_OVERRIDE_OPTIONS=${CCC_OVERRIDE_OPTIONS:-'# +-Wno-missing-designated-field-initializers +-Wno-unused-but-set-global'}
-GW=$(ip route 2>/dev/null | awk '/^default/ {print $3; exit}')
-if [ -n "${GW:-}" ]; then
-  export http_proxy="http://$GW:7980" https_proxy="http://$GW:7980"
-fi
+export http_proxy="$GIT_PROXY" https_proxy="$GIT_PROXY"
 export no_proxy=api.github.com NO_PROXY=api.github.com
 
 if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then

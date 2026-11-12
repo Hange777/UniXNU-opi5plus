@@ -117,10 +117,21 @@ appears (`:9589`), and the readback's boot-buffer pixels go green -> black at th
 (`:10387` t+1590 vs `:10647` t+1595). From t+1620 on, every readback says `window on a compositor
 surface` again and the window never leaves it.
 
-Qualification: this is a **one-off transient zap of the boot surface during the unlock session
-teardown — the driver's late-teardown path, a legal route — not a fallback**: `copy fallbacks` is 0 for
-the whole run and the zero-copy criteria never break. The vop-direct teardown branch that produced it is
-**not yet read in source**; that is the round's one pending follow-up (see the pending item below).
+Qualification — **resolved by source read (post-commit review)**: the single window-to-boot at t+1595
+is the designed blank-swap path, and the run's exclusion of the fallback reading stands — `copy
+fallbacks` is 0 for the whole run and the zero-copy criteria never break. The chain: at the unlock
+instant a fresh IOMFB user client opens (`:9585`, pid 206), and during the session tear-down/rebuild
+the compositor submits one **blank swap** — no surface, all layers off, accepted through the
+validateSwap reason=5 branch (`:1055-1063`). That blank swap reaches `kickOnce()`'s
+`surface == nullptr` branch (`NativeLegacyDisplay.cpp:812-826`) -> `native_legacy_prepare_scanout()`
+(:827) -> `directToBoot()` (:828) -> `flip(bootIova, bootStride)`, and
+`native_legacy_fill_pixels(bootMapping, …, 0xff000000)` paints the boot buffer black (:829-830); the
+frame retires (:839) and the next swap with a surface flips the window back to its slot (:869-883). It
+happens once because blank swaps only occur at session transitions (`back to boot` reads 0 then 1 from
+`:9728` on and never again); the alternatives are excluded — `directToBoot()`'s `directBoot` early-out
+(:382) prevents repeats, the slot-map-failure fallback (:887) would have shown copy fallbacks (0
+throughout), latePaint needs `offline-legacy-paint=1` (not passed, `:2233`), and stop() did not run.
+The upstream question — why IOMFB issues a blank swap at teardown — is not answerable from our logs.
 
 One observation recorded without attribution: stage 32 (`L12 late done`) is already on the beat line at
 the very start of the capture — the first 5 s beat carries it (`:1949`), i.e. by t+150 at the latest —
@@ -139,24 +150,53 @@ The operator confirmed three things on the panel during the run:
 2. **The white blocks are still there** (three white rounded rectangles) — so they are **not the same
    defect** as the banding. The round-2-era "same source" judgement is retired; the white blocks point
    at WidgetRenderer rendering an empty surface, and they are the next display-line target.
-3. **The banding exists in the early boot too** (during the Apple-logo phase) and disappears later. The
-   mechanism is pinned: XNU's early console writes the active scanout buffer directly by CPU —
-   `:1936` `console result 0 base 3866361856` = 0xE6740000, the Esmart2 scanout buffer itself — and a
-   CPU write into the buffer the VOP is concurrently scanning produces the stripes. Once the verbose
-   console goes quiet and the compositor takes over, the stripes stop.
+3. **The banding exists in the early boot too** (during the Apple-logo phase) and disappears later.
+   The **phenomenon is confirmed**: the stripes appear wherever CPU code writes the buffer the VOP is
+   concurrently scanning — XNU's early console writes the active scanout buffer directly by CPU
+   (`:1936` `console result 0 base 3866361856` = 0xE6740000, the Esmart2 scanout buffer itself) and
+   shows the same stripes, and the stripes stop once the verbose console goes quiet and the compositor
+   takes over — and they are avoided under direct scanout.
 
-That is the third sighting of one mechanism (the mirror copy, the early console writes, the early
-paints are all CPU writes into the scanout buffer), and it closes the banding question:
+That is the third sighting of the phenomenon (the mirror copy, the early console writes, the early
+paints are all CPU writes into the scanout buffer). What the run did not confirm is the
+microarchitectural mechanism, and the round-2-era "the GOP copy is byte-complete" readback cannot
+settle it: a readback issued through the same CPU mapping would see the same view the writer sees.
+Two candidates stood — the mapping-attribute audit below eliminates both for kernel-side writers:
 
-> **The banding root cause is the CPU write into the (write-combining) scanout buffer; direct scanout
-> removes every producer of it.** Closed in round 11.
+> **The banding is avoided by direct scanout — confirmed.** Mapping-attribute audit (post-commit
+> review): every kernel mapping that can write a scanout buffer is non-cacheable. The boot/GOP buffer
+> 0xE6740000 is mapped with `provider->mapDeviceMemoryWithIndex(0, kIOMapInhibitCache)`
+> (`package/Opi5plusDisplay/NativeLegacyDisplay.cpp:1100`) -> `kIOInhibitCache` -> VM_WIMG_IO, and the
+> frame buffer lies outside the ADT DRAM window [0x1_0000_0000, 0x2_0000_0000)
+> (`dts/opi5plus.dts:33-36`, `osfmk/mach/arm/vm_param.h:303`) — a non-DRAM VM_WIMG_IO mapping is Device
+> nGnRnE (`osfmk/arm/pmap/pmap.c:5818-5828`): strongly ordered device memory, no cache, no write
+> combining. The sd-paint banding map, unused this round (`sd-paint=0`), goes through `ml_io_map` ->
+> VM_WIMG_IO -> the same nGnRnE (`tools/wsl/331-patch-xnu-data-mount.py:87-100`,
+> `osfmk/arm64/machine_routines.c:1620-1626`). The mirror=1 era's read side mapped its surface
+> cacheable (`map(kIOMapAnywhere | kIOMapReadOnly)`, `NativeLegacyDisplay.cpp:314`) while its writes
+> went through bootMapping nGnRnE with `dsb sy` (:338-348). Every kernel write is followed by
+> `dsb sy` (`NativeLegacyDisplay.cpp:348`, `:833`, `:863`). The write-combining and dirty-cache
+> candidates are eliminated for kernel-side writers. What remains is conjecture: scanout racing
+> unsynchronized CPU writes into the live buffer — the mirror copy (~10 fps), each frame's copy timing
+> alike, so the tear lands on the same rows (the stable bars on a static screen); in the early boot the
+> writer is the firmware's DarwinBoot diagnostic console, whose UEFI mapping attributes are not visible
+> here (if it maps the diagnostic page cacheable and the scan does not snoop, that is a (b)-type
+> stripe; a firmware-side flush after DiagDraw, or the `evb10-fb-wc`-style GRE mapping comparison
+> (`package/LegacyDisplayProbe.cpp:777-785`, not passed this round, off), could settle it next board
+> round). Direct scanout removes the CPU writer, which matches the observed disappearance.
+
+Phenomenon closed in round 11; the mechanism is narrowed by the audit above to the
+scanout-racing-CPU-writes conjecture. *(Correction: the banding mechanism statement in the original
+commit cited write-combining; the audit above replaces it.)*
 
 ## The pending item
 
-Read the vop-direct teardown branch in source to name the code path behind the t+1595 `back to boot 1`
-(criterion 6 above). It is a transient during session teardown, it does not break any zero-copy
-criterion, and the panel behaviour was correct — but the branch should be identified before the next
-display change builds on this round's state.
+Resolved by source read (post-commit review): the single window-to-boot at t+1595 is the designed
+blank-swap path — `kickOnce()`'s `surface == nullptr` branch paints the boot buffer black
+(`directToBoot()` -> `flip(bootIova)` -> `fill_pixels 0xff000000`) while the unlock session is torn
+down and rebuilt, and the next surface swap flips back. One occurrence because blank swaps only happen
+at session transitions. Not a copy fallback (fallbacks 0 throughout). The upstream question (why IOMFB
+issues a blank swap at teardown) is not answerable from our logs; the full chain stands in S6.
 
 ## The observation baseline (new in this round)
 
@@ -165,9 +205,22 @@ The beat line's 7 new fields work end to end. First batch (`:1949`, t+5): `vinac
 603,440, vpur 2,813, vcact 0, vcmode 8, lsr 128`.
 
 * **`lsr`** — the age of the last card-medium read (seconds, from the `cntpct_el0` tick NativeSd writes
-  on every successful read). 0 until about t+1980 (reads go through the Data RAM-disk volume first),
-  then, with the userland quiet, +5 per 5 s beat (36 -> ... -> 128). It counts only card-medium reads,
-  as designed — the `native_sd_last_read_tick` counter is only written on the success path.
+  on every successful read). It counts only card-medium reads, as designed — the
+  `native_sd_last_read_tick` counter is only written on the success path.
+
+  > **Correction (post-commit review).** The earlier reading of this bullet was wrong on two counts.
+  > First, there is no "reads go through the Data RAM-disk volume first" phase on this boot: the Data
+  > volume is not a RAM disk here — `sd-data-persist=1` keeps it on the card (its reads and writes both
+  > reach the card medium), so that explanation is withdrawn. Second, `lsr 0` from the first beat until
+  > about t+1980 does **not** mean "never read": the beat runs every 5 s and fresh card reads always
+  > land within a second before a beat in that period, so those 0s mean **"the last read finished less
+  > than a second ago"**. "Never read" and "read within the last second" were both printed as 0 — a
+  > real ambiguity of the instrument, now fixed in the generator (`tools/wsl/331-patch-xnu-data-mount.py`):
+  > the `last_tick == 0` branch prints `-` instead of 0 (patch 0002 regenerated, sha256
+  > `7c7dab7d1f6e7ae5b46de2b190e9acc946779212cefc0f6a13f86f023f400060`), effective from the next board
+  > round. The round-11 data itself stands unchanged: the quiet-period reading — from about t+1980 the
+  > userland stops reading, `lsr` grows +5 per 5 s beat (36 -> ... -> 128) — prices card reads by age
+  > exactly as published.
 * **`vcmode 8` / `vcact 0`** — the compressor baseline established: mode 8 is freezer semantics, the
   board has no suspended processes, so nothing ever compresses. This is by design. **This is the before
   baseline for a future `vm_compressor=2` comparison boot.**
@@ -203,3 +256,68 @@ cmd.exe /c py -3 tools\boot-uefi.py --port COM3 --baud 1500000 --log logs\boot-r
 
 `--local-payload` walks an rpush over SSH internally; the SPI NOR is never written. The capture covers
 ~2,700 s (16,123 lines, 1,847,265 B).
+
+## Verbatim log excerpts (added post-round-11 for evidence accessibility)
+
+Added in the post-commit review round: `logs/boot-round11.log` lives only in the project working tree
+(gitignored), so the lines this page's verdicts rest on are copied here verbatim. Source:
+`logs/boot-round11.log`, sha256
+`7036121c9af560f8aee19d8e6a1f1500b26525913b300c7b1967bc1267b068e9` (1,847,265 B). Line numbers are
+1-based counting only LF (`\n`), i.e. what ripgrep prints; the file's breaks are CRLF, and the ~1,400
+stray CR characters from serial interleaving make a CR-inclusive count (the way some of this page's
+other citations were taken, e.g. the `:2360` launchd echo and the `:3972` readback) drift ahead of these
+numbers — under that count the boot-args echo sits at 2360 and the first readback at 3972, which is
+where the page's numbers come from.
+
+* Early console writing the scanout buffer directly (original line 1936; CR-inclusive 1937):
+
+```
+opi5plus: console result 0 base 3866361856 row 10240 w 2560 h 1440 depth 32
+```
+
+* The launchd command-line echo (original line 2233; CR-inclusive 2360 — the number the page cites).
+  The line is 1,056 characters and is quoted in full:
+
+```
+com.apple.xpc.launchd|1969-12-31 16:05:33.098120 <Notice>: boot-args = -v serial=1 debug=0x10014e sheng-smp=1 armcpu-self-ipi=1 armcpu-mmio-sgi=0 cpumask=31 sched-slowcpus=240 offline-apfs-load=1 offline-mobile-graphics-load=1 sd-data-seed=1 sd=4 sd-root-trust=1 sd-data-ram=1 sd-data-persist=1 sd-ps=300 sd-exit=1 sd-syscall=1 sd-clock-div=0 sd-watchdog=15 sd-paint=0 sheng-no-lc=1 offline-legacy-register=1 offline-legacy-phase=4 offline-legacy-gop=1 offline-legacy-unit-scale=2 offline-legacy-pm=1 offline-legacy-validate=1 offline-legacy-transfer=1 offline-legacy-cpu-present=1 offline-legacy-default-surface=0 offline-legacy-adopt-surface=1 sheng-vsync=60 rk3588-vop-direct=1 rk3588-vop-esmart=2 rk3588-vop-vp=2 rk3588-vop-fence=1 opi5-gop-mirror=0 sheng-aks=1 offline-key-events=1 opi5-hid=1 opi5-hid-input=2 mali=8 mali-metal=1 opi5plus-bt=SpringBoard opi5plus-bt2=backboardd opi5plus-bt3=liveactivitiesd opi5plus-bt4=chronod opi5plus-bt5=contextstored opi5plus-bt6=biomed opi5plus-bt-secs=30 opi5plus-block-exec=bluetoothd panic_on_crash_disabled=1
+```
+
+* The first `vop direct` line after the first swap (original line 3501; this is the line the S3
+  criterion cites):
+
+```
+opi5: display t+665s: vop direct (iommu 1, status 00000019 00000011): flips 2, surfaces mapped 1 (map failures 0, let go 0, remaps 1, zap timeouts 0), latch mean 1419 us longest 2270 us (0 over 50 ms), copy fallbacks 0, back to boot 0
+```
+
+* The 30 s readback that names the direct-scanout verdict (original line 3502; CR-inclusive 3972 — the
+  number the page cites):
+
+```
+opi5: display t+665s: readback: window f3000000, surface pa 183d44000 px ff000000 ff000000 ff000000 ff000000, boot px ff00ff00 ff00ff00 ff00ff00 ff00ff00 (window on a compositor surface)
+```
+
+* The unlock-animation rate lines (original lines 9947 and 9951). Line 9947 is a fused line: two
+  `printf` outputs lost the CR between them in the serial capture, so the `swap ok 131` line and the
+  hand-over rate line share one physical line — quoted whole, unmodified:
+
+```
+opi5: display t+1630s: swap ok 131 rej 0 (reason 0) copy 131 (status 0, 14745600 B, 0 copies) retired 131 gen 131/131 frames 1 gop 0/131 timeouts 0 prepare-fail 0, sd pio bursts 70370473, chunk us 1857144527, chunks 274194, fill us 1360091764, drain us 15opi5: display t+1630s: swaps handed over (the render server's rate): 120 frames since the last report, busiest second 61, gap shortest 3595 us, mean 19999 us, longest 173431 us
+```
+
+```
+opi5: display t+1630s: frames shown (the scanout's rate): 120 frames since the last report, busiest second 60, gap shortest 16376 us, mean 20042 us, longest 200095 us
+```
+
+* The final-state `swap ok` line the S4 criterion cites (original line 10244; same fused-line defect,
+  quoted whole):
+
+```
+opi5: display t+1655s: swap ok 158 rej 0 (reason 0) copy 158 (status 0, 14745600 B, 0 copies) retired 158 gen 158/158 frames 1 gop 0/158 timeouts 0 prepare-fail 0, sd pio bursts 72565230, chunk us 1886584485, chunks 278013, fill us 1379112549, drain us 15opi5: display t+1655s: swaps handed over (the render server's rate): 2 frames since the last report, busiest second 1, gap shortest 1474360 us, mean 1474360 us, longest 1474360 us
+```
+
+* The final-state `vop direct` line (original line 10246; S3's latch mean 13,965 us and S6's single
+  `back to boot 1`):
+
+```
+opi5: display t+1655s: vop direct (iommu 1, status 00000019 00000011): flips 157, surfaces mapped 3 (map failures 0, let go 0, remaps 3, zap timeouts 0), latch mean 13965 us longest 17108 us (0 over 50 ms), copy fallbacks 0, back to boot 1
+```
