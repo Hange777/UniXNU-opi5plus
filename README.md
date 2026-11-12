@@ -46,7 +46,12 @@ copy, the early console's writes and the early paints; the mapping-attribute aud
 write-combining and dirty-cache candidates for kernel writers, leaving the scanout racing
 unsynchronized CPU writes as the remaining conjecture,
 [`evidence/round11-result.md`](evidence/round11-result.md)) — while the **white blocks remain and are a
-separate defect** (WidgetRenderer rendering an empty surface, the next display-line target).
+separate defect** (WidgetRenderer rendering an empty surface, the next display-line target). Round 12
+(2026-11-12) then signed the mali relay with the owning process and retargeted the sampler at
+`WidgetRenderer_D`: every relay line now carries a pid, the degrade/failure path is 100%
+`backboardd[57]`, the 332x200 signature printed zero times — so the white-block hypothesis is revised
+(conjecture) to a WidgetRenderer surface-content problem, with surface-commit observability as the next
+step pending the user's decision ([`evidence/round12-result.md`](evidence/round12-result.md)).
 `porting.toml`
 marks firmware, cpu and memory `implemented`, and storage, display and input `device-verified`; round 3's measurement is
 [`evidence/round3-result.md`](evidence/round3-result.md), round 2's baseline and root cause is

@@ -35,6 +35,9 @@ extern "C" void native_legacy_surface_rejected(uint64_t,uint64_t,uint32_t,uint32
 // test, both recorded, so the periodic report can say which one disagreed without a debugger.
 extern "C" void native_legacy_transfer_diagnosed(uint64_t,uint64_t,uint64_t,uint32_t,uint32_t,uint64_t,uint64_t,
     uint64_t,uint32_t,uint32_t,uint32_t,uint32_t,uint64_t,uint32_t,uint32_t,uint64_t);
+// The pid of the framebuffer user client, captured at newUserClient (LegacyDisplayProbe.cpp): the source
+// process a validated or rejected swap belongs to.
+extern "C" volatile int native_legacy_client_pid;
 extern "C" bool native_legacy_prepare_scanout(void);
 extern "C" void native_legacy_transfer_observed(IOReturn,const void *,uint64_t);
 extern "C" void native_legacy_copy_timing_observed(uint64_t ticks,uint64_t bytes);
@@ -1061,6 +1064,26 @@ public:
                word(816)==width && word(820)==height && native_legacy_blank_state(word(792),word(796),word(800))) {
                 reason=5;accepted=true;
             }
+        }
+        if(!accepted) {
+            // The rejected swap's own evidence, for the white rounded squares: the geometry of the surface the request
+            // carried (the original IOSurface getters, null-checked here) and the pid of the user client that opened the
+            // framebuffer. A rejecting surface can recur at swap rate (the early touch3 surface rejected every frame),
+            // so this logs at most once per minute and says how many rejections it swallowed since; the totals stay in
+            // the existing counters (native_legacy_swap_rejected_count and the telemetry call below).
+            static uint64_t rejectLoggedUs,rejectsSkipped;
+            uint64_t nowNs=0;absolutetime_to_nanoseconds(mach_absolute_time(),&nowNs);
+            const uint64_t nowUs=nowNs/1000;
+            if(nowUs-rejectLoggedUs>=60000000ull) {
+                rejectLoggedUs=nowUs;
+                if(surface)IOLog("opi5plus: display: swap rejected (reason %u, skipped %llu since): surface %llu x %llu format %#x rowBytes %llu, request %ux%u, client pid %d\n",
+                    reason,(unsigned long long)rejectsSkipped,(unsigned long long)native_legacy_surface_width(surface),
+                    (unsigned long long)native_legacy_surface_height(surface),native_legacy_surface_format(surface),
+                    (unsigned long long)native_legacy_surface_stride(surface),word(816),word(820),native_legacy_client_pid);
+                else IOLog("opi5plus: display: swap rejected (reason %u, skipped %llu since): no surface, request %ux%u, client pid %d\n",
+                    reason,(unsigned long long)rejectsSkipped,word(816),word(820),native_legacy_client_pid);
+                rejectsSkipped=0;
+            } else ++rejectsSkipped;
         }
         if(accepted){addValidated(request);fenceNote(request);}else removeValidated(request);
         native_legacy_swap_validation_observed(accepted,reason,request,surface);return accepted;

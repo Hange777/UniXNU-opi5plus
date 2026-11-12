@@ -362,15 +362,17 @@ kernel_args = [
   # opi5plus-bt / -bt2 ... -bt8 (eight slots, 16 characters each, because PE_parse_boot_argn copies
   # max_len - 1 into a 17-byte buffer) are read in opi5plus_bt_wanted() of
   # patches/xnu/0004-thread-sample.patch (:74-82), and opi5plus-bt-secs in opi5plus_ps_thread() (:411).
-  # DIAGNOSTIC, safe to comment out: the slots name the processes of one experiment at a time -- bt
-  # through bt6 are the round-4..10 set, bt7/bt8 are free. Comment them out first when the command
-  # line needs room.
+  # DIAGNOSTIC, safe to comment out: the slots name the processes of one experiment at a time. Round-12
+  # set: bt/bt2 keep SpringBoard and backboardd, bt4 keeps chronod (all sampled in rounds 4-11);
+  # bt3 moves to WidgetRenderer_D -- the p_comm the "opi5plus: ps" table and the mali sandbox-grant line
+  # print for the white rounded-square renderer (full name WidgetRenderer_Default, pid 433 in round 3,
+  # truncated to 16 characters by MAXCOMLEN, which is exactly what the sampler's strncmp(..., 16) compares);
+  # bt5 (contextstored) and bt6 (biomed) are dropped to leave the command line headroom. bt7/bt8 stay
+  # free; comment slots out first when the command line needs more room.
   "opi5plus-bt=SpringBoard",
   "opi5plus-bt2=backboardd",
-  "opi5plus-bt3=liveactivitiesd",
+  "opi5plus-bt3=WidgetRenderer_D",
   "opi5plus-bt4=chronod",
-  "opi5plus-bt5=contextstored",
-  "opi5plus-bt6=biomed",
   "opi5plus-bt-secs=30",
   # opi5plus-block-exec refuses one execve: patches/xnu/0006-block-exec.patch:74 reads the comma-separated
   # list and matches the program's basename. bluetoothd is the round-4+ entry (268 exit loops -> 0,

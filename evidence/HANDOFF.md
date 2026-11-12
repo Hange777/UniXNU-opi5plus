@@ -1,4 +1,4 @@
-# Handoff - Orange Pi 5 Plus, UniXNU, 2026-11-12 (after round 11)
+# Handoff - Orange Pi 5 Plus, UniXNU, 2026-11-12 (after round 12)
 
 Read `evidence/sd-clock-investigation.md` (rounds 7-10, the SD line's conclusion), then `evidence/round4-6-result.md`
 (rounds 4-6: block-exec, the SD counters, the serial reset key), then `evidence/round3-result.md` for the input
@@ -35,6 +35,18 @@ Round 11 (2026-11-12) then made direct scanout the working display path:
   (patch 0002 regenerated): `vcmode 8` / `vcact 0` is the compressor baseline a future `vm_compressor=2`
   comparison boot measures against, `lsr` prices card-medium reads by age, and the `vfree` floor
   (~1,576 pages at t+2135) is again XNU's designed steady state, not a copy-path artifact.
+
+Round 12 (2026-11-12) then closed the attribution half of the white-block line:
+
+* **The mali relay is signed and the sampler watches the suspect.** Every `mali: user:` line carries
+  the owning process's name and pid (`package/Mali/Mali.cpp`, in the nested repository `package/Mali`),
+  and the sampler slot `bt3` moved to `WidgetRenderer_D` (`bt5`/`bt6` dropped; command line 939 B /
+  51 arguments). On the board: all 3,756 relay lines carry a pid — backboardd[57] 3,643,
+  SpringBoard[27] 96, CollectionsPoste[528] 16, WidgetRenderer_D[491] 1 (only its bundle-loaded
+  line) — the 75 degrade/`ERROR_INITIALIZATION_FAILED` lines are 100% backboardd[57], the round-2-era
+  332x200 signature printed **zero times**, and the white-block hypothesis is revised (conjecture) to
+  a WidgetRenderer surface-content problem (`evidence/round12-result.md`). The validateSwap rejection
+  print is in the payload and stayed untriggered (rej 0 throughout).
 
 ## The infrastructure this session added
 
@@ -86,8 +98,15 @@ Round 11 (2026-11-12) then made direct scanout the working display path:
    console's writer is the firmware's DarwinBoot diagnostic console, whose UEFI mapping attributes are
    not visible here). The
    **white blocks (three white rounded rectangles) remain** and are
-   independent of the banding — the round-11 run split them off. They point at WidgetRenderer rendering an
-   empty surface; that is the next display-line target.
+   independent of the banding — the round-11 run split them off. Round 12 then retired the
+   round-2-era reading that tied them to the A8Unorm 332x200 degrade line: the signed mali relay
+   shows the 332x200/rows-352 signature printed **zero times** in the whole capture while the blocks
+   were on the panel, and the degrade/failure path is 100% backboardd[57] — nothing in it belongs to
+   WidgetRenderer_D. The revised hypothesis (**conjecture**) is a surface-content problem: a
+   WidgetRenderer surface is created and handed to the compositor but never rendered into, and the
+   compositor composites the white fallback. Next step: surface-commit/content observation points on
+   the WidgetRenderer_D side (the sampler slot is already in place; the driver side could log the
+   surfaces it binds) — **pending the user's decision** before another board round.
    Resolved by source read: the single t+1595 `back to boot 1` is the designed blank-swap path —
    `kickOnce()`'s `surface == nullptr` branch paints the boot buffer black (`directToBoot()` ->
    `flip(bootIova)` -> `fill_pixels 0xff000000`) while the unlock session is torn down and rebuilt, and
