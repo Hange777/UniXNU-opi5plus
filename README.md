@@ -20,7 +20,16 @@ in a USB 2.0 Type-A port because a hub or an xHCI port is refused (`NativeUsb.cp
 ([`evidence/round14-result.md`](evidence/round14-result.md)). What is still missing after round 14
 is hot-plug measurement, and interaction exposed a new problem: an application-launch layer defect
 (all opened apps instantly quit with `exit xpcproxy ... code 78`, then the UI render threads wedge
-at the same user PCs and the screen freezes with the compositor no longer committing frames). Earlier
+at the same user PCs and the screen freezes with the compositor no longer committing frames). Round
+15 (2026-11-13) verified the upstream fence fix on the board — with `mali-sched-wait=2` on the
+command line (990 B / 54 arguments, kernel unchanged at `8463916c...`) all 66 fence lines of the
+run read `0 of N swaps arrived with GPU work not done; 0 flips waited, 0 gave up`, including the
+interaction-storm peak, where round 14 read `2503 of 2551 ... longest 250,346 us, 2 gave up` —
+but the screen **still froze** at the first app hover with the swap counter frozen and no fence
+backlog, so the freeze is a second mechanism (the round-14 wedge thread stands as first suspect),
+and the white blocks were confirmed still on the panel by the user (the 5x5 census grid cannot
+sample the block's region; a region-level sampling is the next instrument)
+([`evidence/round15-result.md`](evidence/round15-result.md)). Earlier
 rounds' two names cited as USB evidence do not hold: `IOHIDSystem` is not a class of this kernel at all (`evidence/m5/M5-08`), and
 the `XHCI: Initialize DWC3` / `XhcDriverBindingStart` lines are the firmware's own `XhciDxe.efi` printing before
 `DARWINBOOT: hand-off`, so they prove the firmware has USB, not that XNU does. At that point the picture still
@@ -71,7 +80,14 @@ tier 3 verified enumeration (1532:00a6 on ohci1, boot mouse + boot keyboard inte
 protocol parsed), tier 5 verified the mailbox — real reports into `handleReport` with `errors=0`
 throughout, the injector coexisting, parity at 2,596 swaps / 0 copies / latch mean 11.6 ms — and
 the interaction windows exposed the application-launch layer problem (exit 78 storm + UI-thread
-wedge, [`evidence/round14-result.md`](evidence/round14-result.md)).
+wedge, [`evidence/round14-result.md`](evidence/round14-result.md)). Round 15 (2026-11-13) then
+verified the fence fix `mali-sched-wait=2` (all 66 fence lines `0 of N ... 0 waited, 0 gave up`
+through the interaction storm, vs round 14's `2503 of 2551 ... 2 gave up`), and sharpened the two
+open defects with it: the user confirmed **the white blocks are still on the panel** while the
+census reads mixed — the 5x5 full-frame grid cannot sample the block's region, so a region-level
+sampling is the next instrument — and the screen froze at the first app hover with the swap counter
+frozen and **no fence backlog**, a second wedge mechanism the fence fix does not touch
+([`evidence/round15-result.md`](evidence/round15-result.md)).
 `porting.toml`
 marks firmware, cpu and memory `implemented`, and storage, display and input `device-verified`; round 3's measurement is
 [`evidence/round3-result.md`](evidence/round3-result.md), round 2's baseline and root cause is

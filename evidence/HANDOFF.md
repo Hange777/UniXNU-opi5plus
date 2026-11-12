@@ -1,4 +1,4 @@
-# Handoff - Orange Pi 5 Plus, UniXNU, 2026-11-13 (after round 14)
+# Handoff - Orange Pi 5 Plus, UniXNU, 2026-11-13 (after round 15)
 
 Read `evidence/sd-clock-investigation.md` (rounds 7-10, the SD line's conclusion), then `evidence/round4-6-result.md`
 (rounds 4-6: block-exec, the SD counters, the serial reset key), then `evidence/round3-result.md` for the input
@@ -83,6 +83,28 @@ brought up in two tiers on the board:
   (`evidence/round14-result.md`). **A new problem was exposed by the interaction** and is item 5
   below.
 
+Round 15 (2026-11-13) then verified the upstream fence fix `mali-sched-wait=2` on the board
+(command line 990 B / 54 arguments; kernel unchanged at `8463916c...`, payload `a9c363c6...`,
+`evidence/round15-result.md`):
+
+* **The fence layer is fixed.** All 66 fence lines of the capture read `0 of N swaps arrived with
+  GPU work not done; 0 flips waited (0 us, 0 gave up)` — including the interaction-storm peak
+  (`0 of 372 swaps` at t+1690), against round 14's `2503 of 2551 ... longest 250,346 us, 2 gave up`.
+  The storm itself ran to 394 swaps with every one retired, 0 copies, latch mean 10.1 ms.
+* **The wedge reproduces without it (second mechanism).** The panel froze anyway at the user's
+  App-Store hover: swap counter frozen at 394 from t+1690 through t+2205, `requests` crawling to a
+  stop, no fence backlog, no gave-up, no real panic, the kernel beating and feeding the watchdog
+  the whole time (the board was left on XNU overnight by the user's instruction). Round 14's
+  mach_msg2 wedge-thread suspect (`0x1daf40b58` / `0x1daf46bdc`) stands (item 5).
+* **The white blocks are still there** (user, confirmed) while the census reads `mixed n=16-21` on
+  all three surfaces — the 5x5 full-frame grid cannot sample the block's region, so round 15's
+  `mixed` readings and the 0 `fff2f2f7` occurrences say nothing about the block's interior; the
+  verdict needs region-level sampling at the user's coordinates (item 2).
+* **CollectionsPoste's SIGKILL loop is thinner, not gone:** 5 exits in the t+1590-1680 90 s window
+  (~18 s spacing vs round 13's 12 s), two of them at new own-text crash sites
+  (`0x1b6fe4844` / `0x1b68af448`, esr `0x82000007`); silent after t+1680 only because the wedge
+  stopped the render side. The exit-78 storm is unchanged (191 lines).
+
 ## The infrastructure this session added
 
 * **Round-end automation: the board resets itself back to Linux.** `py -3 tools/wsl/serial-reset.py` sends 0x1d
@@ -151,6 +173,11 @@ brought up in two tiers on the board:
    "the white is inside the surface" to confirmed, or (b) accept the attribution — the white
    content's origin is the render server's composition pipeline, a userland-side matter — and move
    to another direction.
+   Round 15 sharpens this: the user confirmed **the white blocks are still on the panel** in the
+   fence-fixed boot, and the census's `mixed n=16-21` readings coexist with them — the 5x5
+   full-frame grid cannot sample the block's region at all (round 14's `near-uniform fff2f2f7*24`
+   described a whole frame dominated by background, not the block's pixels), so only the region
+   sampling of option (a) can settle it; `mali-sched-wait=2` did not touch the blocks.
    Resolved by source read: the single t+1595 `back to boot 1` is the designed blank-swap path —
    `kickOnce()`'s `surface == nullptr` branch paints the boot buffer black (`directToBoot()` ->
    `flip(bootIova)` -> `fill_pixels 0xff000000`) while the unlock session is torn down and rebuilt, and
@@ -200,7 +227,12 @@ brought up in two tiers on the board:
    scenario; a UI/render-thread wedge plus an app-spawn failure, in the same family as the white
    blocks (WidgetRenderer threads in the wedge queues). **Next step: symbolise the wedge PCs
    against the dyld shared cache (`dsc.py --slide`) and attribute the exit-78 storm**
-   (`evidence/round14-result.md` S4).
+   (`evidence/round14-result.md` S4). Round 15 splits the freeze further: with `mali-sched-wait=2`
+   the fence gave-up path is verified absent (66/66 fence lines at 0% / 0 gave-up, through the
+   storm peak) and the screen **still** froze at the App-Store hover with the swap counter frozen
+   at 394 — a second wedge mechanism, independent of the fence backlog, with CollectionsPoste's
+   SIGKILL loop running thinner (5 exits, ~18 s spacing, two at new own-text sites
+   `0x1b6fe4844` / `0x1b68af448`) inside the same window (`evidence/round15-result.md` S2-S3).
 
 ## Key commands
 
@@ -241,7 +273,8 @@ the byte — which is why the reset itself never appears in the capture.
   written. Round 4 sat at 981 bytes / 53 arguments (round 3: 993 / 54; the round-4 re-shuffle dropped
   `sd-auto-reboot=3600` and `offline-legacy-paint=0` and added `opi5plus-block-exec=bluetoothd`); since
   round 11 it is **985 bytes / 53 arguments** (`sd-trace-io=0` dropped for budget — its default is 0 —
-  `opi5-gop-mirror=0` added), so adding an argument still means dropping one.
+  `opi5-gop-mirror=0` added), and since round 15 **990 bytes / 54 arguments** (`mali-sched-wait=2`
+  appended; 10 bytes of headroom left), so adding an argument still means dropping one.
 * `prepare-xnu-source.py` restores 26 Apple headers over HTTPS and direct TLS is reset on this network; export the
   proxy above or the build stops there.
 * A leftover `startup.o.json` compile record makes the bootstrap pass skip and `archive-03` fail: move it aside

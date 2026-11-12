@@ -208,7 +208,7 @@ trust_cache_sha256 = [
 #             the owner-trusted stand-in for /usr/libexec/mobileactivationd is killed for a launch-constraint
 #             violation before it runs (evidence/m7/M7-10).
 #
-# The production command line since round 11 -- 53 arguments, 985 bytes of the 1000-byte limit --
+# The production command line since round 16 -- 54 arguments, 990 bytes of the 1000-byte limit --
 # is complete in this array: tools/wsl/pack-payload.sh passes no --kernel-arg, so this list is the
 # only argument source. The round scripts (tools/wsl/tmp-payload-r10.sh and earlier) still carry
 # their own copies; scripts/unixnu/payload.py:93-96 drops the board entry whose name a --kernel-arg
@@ -380,6 +380,19 @@ kernel_args = [
   # payload carries one; the CoreAnimation properties it writes are switched by sd-gpu-prefs (also on
   # by default). Both of those are read in patches/xnu/0003-gpu-addon.patch:460 and :512.
   "mali-metal=1",
+  # mali-sched-wait=2  a command buffer that works on an IOSurface delivers "scheduled" only when the GPU
+  #   has finished it, in every process including the render server (the plugin reads the boot arg into
+  #   NATIVE_METAL_SCHED_WAIT at metal-plugin/NativeMaliMetalPlugin.mm:1910-1916; the wait itself is
+  #   NativeBridgeMetalFrontend.mm:2928-2939 and 3136-3160 -- user space only, package/Mali does not
+  #   parse it, so the kernel does not change). Upstream board.toml:155 (UniXNU-orangepi5 @729ba25f)
+  #   defaults it, with the board evidence evidence/device-snapshots-20261106.txt: without it the first
+  #   open of an app is a launch snapshot handed over before the GPU finished, the fence backlog of an
+  #   interaction burst piles to ~250 ms and gives up (d29: 1045/1060 waited, longest 250352us, 1 gave
+  #   up -- the same shape as our rounds 11-14), the swap counter freezes on the last frame and the
+  #   surface keeps the background colour (white blocks / white apps); with =2 the whole snapshot is
+  #   drawn first (d33/d34: 21/810, longest 14078us, 0 gave up, ten of ten launch pictures whole).
+  #   Round-15 verdict: missing it = gave-up -> swap freeze -> white blocks / white apps / wedged.
+  "mali-sched-wait=2",
   # "mali-pll=1",
   # "mali-div=1",
   # "mali-ycbcr-filter=device",
