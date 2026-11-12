@@ -192,14 +192,20 @@ trust_cache_sha256 = [
 #             rk3588-slow-cores.patch; cpumask counts logical CPUs and leaves the four Cortex-A76 cores
 #             (0..3, listed first in the DTS) plus the boot A55.
 #   loads     offline-apfs-load and offline-mobile-graphics-load are read by the base patch
-#             patches/xnu/offline-component-load-probes.patch (the same patch also reads
-#             offline-legacy-register, which is disabled below because nothing links a display yet).
+#             patches/xnu/offline-component-load-probes.patch:23 and :70 (the same patch also reads
+#             offline-legacy-register, which the display group below now enables).
 #   security  sheng-no-lc=1 is read by the base (arch) series patch
 #             patches/xnu/zzyc-owner-skip-launch-constraints.patch, at the head of
 #             mac_proc_check_launch_constraints() in security/mac_process.c: the early return sits before
 #             MAC_POLICY_ITERATE, so AMFI's mpo_proc_check_launch_constraints hook never runs. Without it
 #             the owner-trusted stand-in for /usr/libexec/mobileactivationd is killed for a launch-constraint
 #             violation before it runs (evidence/m7/M7-10).
+#
+# The production command line of rounds 2-10 -- 53 arguments, 981 bytes of the 1000-byte limit --
+# is complete in this array: tools/wsl/pack-payload.sh passes no --kernel-arg, so this list is the
+# only argument source. The round scripts (tools/wsl/tmp-payload-r10.sh and earlier) still carry
+# their own copies; scripts/unixnu/payload.py:93-96 drops the board entry whose name a --kernel-arg
+# repeats, so both paths produce the same 53 arguments.
 kernel_args = [
   "-v",
   "serial=1",
@@ -216,46 +222,83 @@ kernel_args = [
   # /private/var tree, the runtime directories (keybags, mobile, mobile/tmp, tmp, run), the container
   # tree and the five preference plists that skip the Setup assistant (opi5plus_seed_tree,
   # opi5plus_seed_prefs_write). The argument is read in opi5plus_userland_prepare() by
-  # PE_parse_boot_argn. sd-data-seed=0 turns the seeding off and leaves the volume as the mount left
-  # it, which is the way back if the seed itself is what a boot trips over. The MobileGestalt cache
-  # wipe that runs next to it is not switched, because it is three unlinks of files that are rewritten
-  # on the next query (opi5plus_wipe_mobilegestalt).
+  # PE_parse_boot_argn (patches/xnu/0002-mount-data-volume.patch:1414). sd-data-seed=0 turns the
+  # seeding off and leaves the volume as the mount left it, which is the way back if the seed itself
+  # is what a boot trips over. The MobileGestalt cache wipe that runs next to it is not switched,
+  # because it is three unlinks of files that are rewritten on the next query
+  # (opi5plus_wipe_mobilegestalt).
   "sd-data-seed=1",
+  # --- SD storage: package/NativeSd and the patch-0002 hooks ------------------------------------------
+  # Parsers, verified in source. package/NativeSd/NativeSd.cpp: sd= (bootArg("sd"), :1452; 4 = the SD
+  # card root plus the Data volume, the only block device this board has), sd-root-trust (:1453,
+  # :777-810, bsd_init accepts the SD root without Apple's root hashes), sd-data-persist (:1542, the
+  # card window at the end of userdata), sd-data-ram (:1549, the payload's Data seed), sd-trace-io
+  # (:171, the per-request block trace), sd-clock-div (:1499-1505, 0 leaves the firmware's card-clock
+  # divider off). patches/xnu/0002-mount-data-volume.patch: sd-syscall (:96), sd-paint (:1463),
+  # sd-watchdog (:1431), sd-ps (:1559), sd-exit (:1721).
+  #   sd-syscall=1  DIAGNOSTIC, safe to comment out: the per-syscall trace on the UART.
+  #   sd-watchdog=15  MUST STAY: it arms the RK3588 watchdog (patch 0002:1429-1440) and the heartbeat
+  #     thread kicks it every 5 s (patch 0002:1631). That kick is the feed.
+  #   sd-ps=300  MUST STAY: patch 0002:1559-1567 terminates the heartbeat thread when both sd-ps and
+  #     sd-auto-reboot are 0; with no beat thread nothing kicks the watchdog and the board resets
+  #     every ~89 s (timeout index 15). 300 also prints the process table every 300 s.
+  #   sd-auto-reboot  deliberately absent: the user asked for the timed self-reboot to go. Patch 0002
+  #     :1560-1563 still parses the name if a future round wants it back; a panic reset remains the
+  #     last resort while the watchdog covers a hang.
+  "sd=4",
+  "sd-root-trust=1",
+  "sd-data-ram=1",
+  "sd-data-persist=1",
+  "sd-ps=300",
+  "sd-exit=1",
+  "sd-syscall=1",
+  "sd-trace-io=0",
+  "sd-clock-div=0",
+  "sd-watchdog=15",
+  "sd-paint=0",
   # --- security: the launch-constraint escape for owner-trusted binaries -----------------------------
   # Parser as in the header. The stand-in payload script (tools/wsl/tmp-payload-stub.sh) also passes this
   # argument; payload.py replaces the board's entry with a --kernel-arg of the same name, so the two paths
   # produce one argument, not two.
   "sheng-no-lc=1",
-  # --- diagnostics: the sampler's boot arguments, one experiment at a time ----------------------------
-  # patches/xnu/0004-thread-sample.patch reads these: opi5plus-bt / -bt2 ... -bt8 (eight slots, 16
-  # characters each, because PE_parse_boot_argn copies max_len - 1 into a 17-byte buffer) in
-  # opi5plus_bt_wanted(), and opi5plus-bt-secs in opi5plus_ps_thread() of bsd/kern/kern_exec.c.
-  # They stay commented out because they name the processes of one experiment at a time, and the
-  # throw-away payload script that runs that experiment passes them: payload.py drops the board
-  # argument whose name a --kernel-arg repeats (scripts/unixnu/payload.py:93-96), so the two paths
-  # cannot produce a duplicate. tools/wsl/tmp-payload-stub.sh passes slots 1-4 today (SpringBoard,
-  # backboardd, mobileactivation, chronod); slots 5-8 are free.
-  # "opi5plus-bt=SpringBoard",
-  # "opi5plus-bt2=backboardd",
-  # "opi5plus-bt3=mobileactivation",
-  # "opi5plus-bt4=chronod",
-  # "opi5plus-bt-secs=30",
-  # --- display: switched on with the presenter at M5 ------------------------------------------------
-  # drivers/GopFramebuffer/NativeLegacyDisplay.cpp parses these, and the archive joins the kernel through
-  # CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y in configs/opi5plus_defconfig (currently `n`, because no build script
-  # produces the archive for this board). Enabling the arguments without the archive changes nothing.
-  # "offline-legacy-register=1",
-  # "offline-legacy-phase=4",
-  # "offline-legacy-gop=1",
-  # "offline-legacy-pm=1",
-  # "offline-legacy-validate=1",
-  # "offline-legacy-transfer=1",
-  # "offline-legacy-cpu-present=1",
-  # "sheng-vsync=60",
-  # --- console mirror: needs a board patch this repository does not have yet --------------------------
+  # --- display: the GOP presenter, the working path since round 2 --------------------------------------
+  # Fact as of rounds 2-10: the GOP blit path is the working display path (lock screen in round 2,
+  # desktop in round 3, evidence/round3-result.md); the VOP direct scanout flips frames but does not
+  # reach the panel yet (evidence/m7/M7-05). Parsers, verified in source: package/Opi5plusDisplay/
+  # NativeLegacyDisplay.cpp reads offline-legacy-pm (:517), offline-legacy-phase (:519, :894, :1001),
+  # offline-legacy-default-surface (:595), offline-legacy-adopt-surface (:725),
+  # offline-legacy-register (:757), offline-legacy-transfer (:799), offline-legacy-cpu-present (:980),
+  # offline-legacy-validate (:1012) and offline-legacy-gop (:1093); offline-legacy-unit-scale is read
+  # by package/LegacyDisplayProbe.cpp:535. The archive is built by build-opi5plus-display.py
+  # ([kernel] archives above) and linked by CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y in
+  # configs/opi5plus_display_defconfig, the defconfig the board builds with.
+  "offline-legacy-register=1",
+  "offline-legacy-phase=4",
+  "offline-legacy-gop=1",
+  "offline-legacy-unit-scale=2",
+  "offline-legacy-pm=1",
+  "offline-legacy-validate=1",
+  "offline-legacy-transfer=1",
+  "offline-legacy-cpu-present=1",
+  "offline-legacy-default-surface=0",
+  "offline-legacy-adopt-surface=1",
+  # sheng-vsync=<Hz> starts the display refresh tick: package/Opi5plusDisplay/NativeLegacyDisplay.cpp
+  # (:450, :761, :773). 60 is the round-4+ value.
+  "sheng-vsync=60",
+  # --- VOP2 zero-copy scanout: the Esmart window the display step runs on ------------------------------
+  # Parsers: rk3588-vop-direct and rk3588-vop-fence are read in package/Opi5plusDisplay/
+  # NativeLegacyDisplay.cpp (:205 and :223; rk3588-vop-fence-check at :225 is not passed);
+  # rk3588-vop-esmart and rk3588-vop-vp are read by the SoC-shared scanout archive that the [kernel]
+  # archives force-load (build-rk3588-vop-direct.py) -- feeds.toml rk3588 = UniXNU-rk3588-common
+  # b5f5d949, scripts/data/Rk3588VopDirect/Rk3588VopDirect.cpp:69-70 (window Esmart2 / VP2, M7-05).
+  "rk3588-vop-direct=1",
+  "rk3588-vop-esmart=2",
+  "rk3588-vop-vp=2",
+  "rk3588-vop-fence=1",
+  # --- console mirror: no parser in this repository ---------------------------------------------------
   # vc_mirror is not a base XNU argument: the EVB10 gets it from its own patches/xnu/evb10-vc-mirror.patch
-  # (osfmk/console/serial_console.c, pexpert/arm/pe_init.c). This repository's patches/xnu/series is empty
-  # until M3, so the argument is inert here and stays off.
+  # (osfmk/console/serial_console.c, pexpert/arm/pe_init.c). Nothing in this repository's patches/xnu/
+  # (0001-0007) parses it, so the argument is inert here and stays off.
   # "vc_mirror=1",
   # --- keystore: the owned AppleKeyStore probe, in this repository ------------------------------------
   # sheng-aks and offline-key-events are parsed by package/KeyStoreProbe.cpp: native_aks_state_enabled()
@@ -275,34 +318,66 @@ kernel_args = [
   # keybag operation fails against it.
   "sheng-aks=1",
   "offline-key-events=1",
-  # sheng-touch-hid stays out of this list because there is no touch panel on this board, not because the
-  # argument is an EVB10 leftover: this repository's package/Opi5plusHid/NativeHidInput.cpp parses it, and it
-  # alone decides whether the merged report descriptor carries the digitizer collection (with report ID 3).
-  # The round-3 injector switches that collection on by itself, so the payload script selects it with the value
-  # of opi5-hid-input instead of a new name here: 1 builds the device only, 2 and above also starts the
-  # synthetic report injector (package/Opi5plusHidProbe.cpp parses the value; evb10-hid-input is its alias).
-  # Input on this board is scripted injection and then USB HID.
+  # --- input: the HID device and the synthetic injector ------------------------------------------------
+  # Parsers, verified in source: opi5-hid is read by package/LegacyDisplayProbe.cpp:914 (it loads the
+  # original IOHIDFamily and starts NativeHidInput on the IOHIDResource device); opi5-hid-input is read
+  # by package/Opi5plusHidProbe.cpp:116-117 (evb10-hid-input is its alias): 1 builds the device only,
+  # 2 and above also force the digitizer collection on and start the synthetic report injector
+  # (package/Opi5plusHid/NativeHidInput.cpp:146, :286). Round 3 reached the desktop with =2
+  # (evidence/round3-result.md), so the value stays here for a plain rebuild.
+  # sheng-touch-hid stays out of this list because there is no touch panel on this board, not because
+  # the argument is an EVB10 leftover: this repository's package/Opi5plusHid/NativeHidInput.cpp parses
+  # it, and it alone decides whether the merged report descriptor carries the digitizer collection
+  # (with report ID 3). =2 switches that collection on by itself; input on this board is scripted
+  # injection first and USB HID next.
+  "opi5-hid=1",
+  "opi5-hid-input=2",
   # --- GPU: the Mali-G610 (M7 in plan.md, M4 in the reference port's docs) --------------------------
-  # mali=<milestone> is parsed in package/Mali/Mali.cpp: 1 power and GPU_ID, 2 firmware and MCU,
+  # mali=<milestone> is parsed in package/Mali/Mali.cpp:3086: 1 power and GPU_ID, 2 firmware and MCU,
   # 3 command stream, 6/7 several groups, 8 the IOKit service with its user client. The archive is now
   # built (build-mali-firmware.py + build-opi5plus-drivers.py Mali) and force-loaded by
   # configs/opi5plus_display_defconfig.
   "mali=8",
   # mali-metal=1 lets the driver serve the Metal plug-in: the bundle arrives through the GPU add-on and
-  # patch 0003 mounts it over /System/Library/Extensions. The add-on itself is switched by sd-gpu-addon,
-  # on by default when the payload carries one; the CoreAnimation properties it writes are switched by
-  # sd-gpu-prefs (also on by default). Both are read in patches/xnu/0003-gpu-addon.patch.
+  # patch 0003 mounts it over /System/Library/Extensions. mali-metal itself is parsed in
+  # package/Mali/Mali.cpp:2897. The add-on itself is switched by sd-gpu-addon, on by default when the
+  # payload carries one; the CoreAnimation properties it writes are switched by sd-gpu-prefs (also on
+  # by default). Both of those are read in patches/xnu/0003-gpu-addon.patch:460 and :512.
   "mali-metal=1",
   # "mali-pll=1",
   # "mali-div=1",
   # "mali-ycbcr-filter=device",
   # "mali-aflush=1",
   # "mali-epri=50",
+  # --- diagnostics: the sampler slots and the exec gate, one experiment at a time ---------------------
+  # opi5plus-bt / -bt2 ... -bt8 (eight slots, 16 characters each, because PE_parse_boot_argn copies
+  # max_len - 1 into a 17-byte buffer) are read in opi5plus_bt_wanted() of
+  # patches/xnu/0004-thread-sample.patch (:74-82), and opi5plus-bt-secs in opi5plus_ps_thread() (:411).
+  # DIAGNOSTIC, safe to comment out: the slots name the processes of one experiment at a time -- bt
+  # through bt6 are the round-4..10 set, bt7/bt8 are free. Comment them out first when the command
+  # line needs room.
+  "opi5plus-bt=SpringBoard",
+  "opi5plus-bt2=backboardd",
+  "opi5plus-bt3=liveactivitiesd",
+  "opi5plus-bt4=chronod",
+  "opi5plus-bt5=contextstored",
+  "opi5plus-bt6=biomed",
+  "opi5plus-bt-secs=30",
+  # opi5plus-block-exec refuses one execve: patches/xnu/0006-block-exec.patch:74 reads the comma-separated
+  # list and matches the program's basename. bluetoothd is the round-4+ entry (268 exit loops -> 0,
+  # README). DIAGNOSTIC, safe to comment out when bluetoothd's behaviour is wanted again.
+  "opi5plus-block-exec=bluetoothd",
+  # panic_on_crash_disabled is a base-XNU TUNABLE (the pinned refer xnu-10063.141.1,
+  # bsd/kern/kern_exit.c:1695): it stops a crashing task from panicking the kernel, so the exit ring
+  # (patch 0002, sd-exit=1 above) can record the death. DIAGNOSTIC, safe to comment out when the
+  # kernel should panic on a userland crash again.
+  "panic_on_crash_disabled=1",
   # --- dropped outright, not deferred ----------------------------------------------------------------
   # emmc=* / emmc-root-trust / emmc-systemos-union / emmc-data-*: read by the Rk3588Emmc driver and its
   #   binding script, and this board has no eMMC. When the module arrives these are Plan A (see [userdata]).
-  # evb10-vop* / evb10-fb-*: the EVB10's VOP2 scan-out driver. This board's display is HDMI through the
-  #   firmware's GOP; a VOP2 fallback would get its own argument names, not the EVB10's.
+  # evb10-vop* / evb10-fb-*: the EVB10's VOP2 scan-out driver. The VOP scanout did arrive with its own
+  #   argument names (the rk3588-vop-* group above), not the EVB10's; the GOP blit path is still the
+  #   working display path.
   # evb10-touch*: the EVB10's DSI panel and its coordinate mapping, parsed by its package/Evb10Touch and
   #   package/Evb10Hid, neither of which this repository has. There is no touch panel here.
   # evb10-hid-input: not dropped - package/Opi5plusHidProbe.cpp accepts it as an alias of opi5-hid-input, and
@@ -310,7 +385,7 @@ kernel_args = [
   # wdt-kick: searched for in UniXNU, UniXNU-rk3588-common and this repository; the only occurrence is the
   #   EVB10's own board.toml comment. Nothing in the shared tree parses it.
   # -enable_kprintf_spam: carried by the EVB10, but its parser is not in any repository checked in here
-  #   (the XNU refer is fetched, not vendored), so it is left out until M3 can confirm it.
+  #   (the XNU refer is fetched, not vendored), so it stays out.
 ]
 
 [payload.adt]
