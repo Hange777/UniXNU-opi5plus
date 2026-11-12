@@ -142,6 +142,10 @@ volatile uint64_t native_sd_write_calls = 0;      // host write calls
 volatile uint64_t native_sd_pio_bursts = 0;       // sd::Stats::pioBursts as of the last read call
 volatile uint64_t native_sd_chunk_us = 0;         // microseconds spent inside successful chunk reads
 volatile uint64_t native_sd_chunks = 0;           // successful chunk reads timed
+// The kernel beat line's "lsr" field: the physical-counter tick (cntpct_el0) at which the last readBlocks
+// succeeded, written on the success path under the same lock that refreshes the counters above. 0 = no read
+// has completed yet. Counting only -- nothing here prints, sleeps or changes what the transfer loop does.
+volatile uint64_t native_sd_last_read_tick = 0;
 // Round 9 diagnostics. The clock registers are read back once, right after a clock update lands, because
 // the CLKDIV in the boot log is the firmware's dump from before the driver took over and cannot answer
 // "which card clock actually ran". The two phase counters split the PIO read path: filling the FIFO
@@ -391,6 +395,14 @@ class NativeSd : public IOService {
 		native_sd_commands = stats.commands;
 		native_sd_timeouts = stats.timeouts;
 		native_sd_pio_bursts = stats.pioBursts;
+		if (result == sd::kOk) {
+			// The beat line's lsr: when the last successful read finished. The counter is the one the
+			// chunk path below times with (no side effect on the FIFO); the kernel divides the delta by
+			// cntfrq_el0, so both sides stay on the same timebase.
+			uint64_t readTick = 0;
+			__asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(readTick));
+			native_sd_last_read_tick = readTick;
+		}
 		IOLockUnlock(gate);
 		if (result == sd::kOk) return kIOReturnSuccess;
 		return result == sd::kErrTimeout ? kIOReturnTimeout : kIOReturnIOError;

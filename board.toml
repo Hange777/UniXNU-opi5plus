@@ -201,7 +201,7 @@ trust_cache_sha256 = [
 #             the owner-trusted stand-in for /usr/libexec/mobileactivationd is killed for a launch-constraint
 #             violation before it runs (evidence/m7/M7-10).
 #
-# The production command line of rounds 2-10 -- 53 arguments, 981 bytes of the 1000-byte limit --
+# The production command line since round 11 -- 53 arguments, 985 bytes of the 1000-byte limit --
 # is complete in this array: tools/wsl/pack-payload.sh passes no --kernel-arg, so this list is the
 # only argument source. The round scripts (tools/wsl/tmp-payload-r10.sh and earlier) still carry
 # their own copies; scripts/unixnu/payload.py:93-96 drops the board entry whose name a --kernel-arg
@@ -233,9 +233,9 @@ kernel_args = [
   # card root plus the Data volume, the only block device this board has), sd-root-trust (:1453,
   # :777-810, bsd_init accepts the SD root without Apple's root hashes), sd-data-persist (:1542, the
   # card window at the end of userdata), sd-data-ram (:1549, the payload's Data seed), sd-trace-io
-  # (:171, the per-request block trace), sd-clock-div (:1499-1505, 0 leaves the firmware's card-clock
-  # divider off). patches/xnu/0002-mount-data-volume.patch: sd-syscall (:96), sd-paint (:1463),
-  # sd-watchdog (:1431), sd-ps (:1559), sd-exit (:1721).
+  # (:171, the per-request block trace; no longer passed, see below), sd-clock-div (:1499-1505, 0 leaves
+  # the firmware's card-clock divider off). patches/xnu/0002-mount-data-volume.patch: sd-syscall (:96),
+  # sd-paint (:1463), sd-watchdog (:1431), sd-ps (:1559), sd-exit (:1721).
   #   sd-syscall=1  DIAGNOSTIC, safe to comment out: the per-syscall trace on the UART.
   #   sd-watchdog=15  MUST STAY: it arms the RK3588 watchdog (patch 0002:1429-1440) and the heartbeat
   #     thread kicks it every 5 s (patch 0002:1631). That kick is the feed.
@@ -252,7 +252,10 @@ kernel_args = [
   "sd-ps=300",
   "sd-exit=1",
   "sd-syscall=1",
-  "sd-trace-io=0",
+  # sd-trace-io: default 0, verified in round 4 (NativeSd.cpp:170-173 -- uint32_t value = 0, a failed
+  # PE_parse_boot_argn leaves it 0), so passing nothing is the same value; commented out for the
+  # 1000-byte command-line budget in round 11.
+  # "sd-trace-io=0",
   "sd-clock-div=0",
   "sd-watchdog=15",
   "sd-paint=0",
@@ -295,6 +298,12 @@ kernel_args = [
   "rk3588-vop-esmart=2",
   "rk3588-vop-vp=2",
   "rk3588-vop-fence=1",
+  # opi5-gop-mirror=0  round-11 direct-output experiment. Parser: package/Opi5plusDisplay/
+  #   NativeLegacyDisplay.cpp:220 (default 1; =0 stops the CPU copy of the latched frame back into the GOP
+  #   buffer and leaves the window on the compositor surface). Rounds 2-10 measured the mirror CPU copy at
+  #   88-96 ms/frame; 0 lets the VOP window stay on the compositor surface -- upstream orangepi5 behavior,
+  #   latch ~6.4 ms. Flip back to 1 if the panel goes stale.
+  "opi5-gop-mirror=0",
   # --- console mirror: no parser in this repository ---------------------------------------------------
   # vc_mirror is not a base XNU argument: the EVB10 gets it from its own patches/xnu/evb10-vc-mirror.patch
   # (osfmk/console/serial_console.c, pexpert/arm/pe_init.c). Nothing in this repository's patches/xnu/

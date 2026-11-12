@@ -255,7 +255,7 @@ index 8a1ec42..72683eb 100644
 +}
 +#endif /* DEVELOPMENT || DEBUG */
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 8bba078..33ba031 100644
+index 8bba078..b57a797 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -5121,6 +5121,12 @@ proc_exec_switch_task(proc_t old_proc, proc_t new_proc, task_t old_task, task_t
@@ -286,7 +286,7 @@ index 8bba078..33ba031 100644
  
  	/*
  	 * Copy out program name.
-@@ -8055,3 +8069,1580 @@ sysctl_libmalloc_experiments SYSCTL_HANDLER_ARGS
+@@ -8055,3 +8069,1628 @@ sysctl_libmalloc_experiments SYSCTL_HANDLER_ARGS
  }
  
  EXPERIMENT_FACTOR_PROC(_kern, libmalloc_experiments, CTLTYPE_QUAD | CTLFLAG_RW, 0, 0, &sysctl_libmalloc_experiments, "A", "");
@@ -300,10 +300,14 @@ index 8bba078..33ba031 100644
 + * The beat line's page counters (vfree/vspec/vcomp) are osfmk state, behind <vm/vm_page.h>. A bsd object does
 + * not compile against that header -- it is not exported, and its kern/misc_protos.h declares setbit(), which
 + * bsd/sys/param.h already defines as a macro -- so opi5plus_vm_page_counts(), in osfmk/kern/debug.c, reads them
-+ * where the header is legal and hands the three numbers over.
++ * where the header is legal and hands the numbers over. The first three outputs are the fields the beat line
++ * already printed; the six after them feed the round-11 observability fields (vinact/vact/vext/vpur are the
++ * jetsam-facing queues, vcact/vcmode the compressor state) and the read-only outputs stay optional (NULL skips).
 + */
 +extern void opi5plus_vm_page_counts(unsigned long long *free_pages, unsigned long long *speculative_pages,
-+    unsigned long long *compressor_pages);
++    unsigned long long *compressor_pages, unsigned long long *inactive_pages, unsigned long long *active_pages,
++    unsigned long long *pageable_external_pages, unsigned long long *purgeable_pages,
++    unsigned long long *compressor_active, unsigned long long *compressor_mode);
 +/*
 + * Orange Pi 5 Plus: mount the payload's Data volume on /private/var before the first exec of the init
 + * program.
@@ -1512,6 +1516,9 @@ index 8bba078..33ba031 100644
 +extern volatile uint64_t native_sd_block_requests;
 +extern volatile uint64_t native_sd_block_failures;
 +extern volatile uint64_t native_sd_blocks_read;
++/* The beat line's lsr: NativeSd writes the physical-counter tick at which its last readBlocks succeeded, under
++ * the same lock that refreshes the counters above (package/NativeSd/NativeSd.cpp, the readBlocks success path). */
++extern volatile uint64_t native_sd_last_read_tick;
 +
 +static void
 +opi5plus_pe_char(char c)
@@ -1604,14 +1611,37 @@ index 8bba078..33ba031 100644
 +			unsigned long long vfree_pages = 0;
 +			unsigned long long vspec_pages = 0;
 +			unsigned long long vcomp_pages = 0;
++			unsigned long long vinact_pages = 0;
++			unsigned long long vact_pages = 0;
++			unsigned long long vext_pages = 0;
++			unsigned long long vpur_pages = 0;
++			unsigned long long vcact_pages = 0;
++			unsigned long long vcmode_pages = 0;
 +
-+			opi5plus_vm_page_counts(&vfree_pages, &vspec_pages, &vcomp_pages);
++			opi5plus_vm_page_counts(&vfree_pages, &vspec_pages, &vcomp_pages, &vinact_pages,
++			    &vact_pages, &vext_pages, &vpur_pages, &vcact_pages, &vcmode_pages);
 +			opi5plus_pe_puts(", vfree ");
 +			opi5plus_pe_number(vfree_pages);
 +			opi5plus_pe_puts(", vspec ");
 +			opi5plus_pe_number(vspec_pages);
 +			opi5plus_pe_puts(", vcomp ");
 +			opi5plus_pe_number(vcomp_pages);
++			/* The jetsam-facing queues and the compressor state, after the fields the beat already printed:
++			 * inactive/active and the pageable-external/purgeable counts are what the memory-pressure logic
++			 * and jetsam look at, and the compressor pair says whether pages can still be compressed and in
++			 * which mode (VM_PAGER_* in vm_pageout.h). */
++			opi5plus_pe_puts(", vinact ");
++			opi5plus_pe_number(vinact_pages);
++			opi5plus_pe_puts(", vact ");
++			opi5plus_pe_number(vact_pages);
++			opi5plus_pe_puts(", vext ");
++			opi5plus_pe_number(vext_pages);
++			opi5plus_pe_puts(", vpur ");
++			opi5plus_pe_number(vpur_pages);
++			opi5plus_pe_puts(", vcact ");
++			opi5plus_pe_number(vcact_pages);
++			opi5plus_pe_puts(", vcmode ");
++			opi5plus_pe_number(vcmode_pages);
 +			if (data != NULL && !vfs_isunmount(data)) {
 +				statfs = vfs_statfs(data);
 +			}
@@ -1620,6 +1650,24 @@ index 8bba078..33ba031 100644
 +				opi5plus_pe_puts("-1");
 +			} else {
 +				opi5plus_pe_number((unsigned long long)statfs->f_bavail);
++			}
++		}
++		/* lsr: seconds since the last successful SD read, separating "nobody has asked the card for a block"
++		 * from "a read was issued and has not come back" (a 0 means no read has completed yet). The tick is
++		 * the one NativeSd writes on its readBlocks success path, and this reads the same counter (cntpct_el0)
++		 * the driver times its chunk reads with; cntfrq_el0 is that counter's frequency. */
++		{
++			uint64_t lsr_now_tick = 0;
++			uint64_t lsr_tick_freq = 0;
++			uint64_t lsr_last_tick = native_sd_last_read_tick;
++
++			__asm__ volatile("isb\n\tmrs %0, cntpct_el0" : "=r"(lsr_now_tick));
++			__asm__ volatile("isb\n\tmrs %0, cntfrq_el0" : "=r"(lsr_tick_freq));
++			opi5plus_pe_puts(", lsr ");
++			if (lsr_last_tick == 0 || lsr_tick_freq == 0) {
++				opi5plus_pe_puts("0");
++			} else {
++				opi5plus_pe_number((lsr_now_tick - lsr_last_tick) / lsr_tick_freq);
 +			}
 +		}
 +		opi5plus_pe_puts("\r\n");
@@ -1885,7 +1933,7 @@ index 11a8212..2ec212f 100644
  		panic("%s: Process %s with pid %d exited on error with code 0x%x.",
  		    __FUNCTION__, p->p_comm, proc_getpid(p), rv);
 diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
-index e9daeed..e4daf1b 100644
+index e9daeed..0a9a6dc 100644
 --- a/osfmk/kern/debug.c
 +++ b/osfmk/kern/debug.c
 @@ -1184,6 +1184,17 @@ panic_trap_to_debugger(const char *panic_format_str, va_list *panic_args, unsign
@@ -1906,19 +1954,29 @@ index e9daeed..e4daf1b 100644
  	PE_panic_hook(panic_format_str);
  
  #if defined (__x86_64__)
-@@ -2262,3 +2273,23 @@ set_awl_scratch_exists_flag_and_subscribe_for_pm(void)
+@@ -2262,3 +2273,51 @@ set_awl_scratch_exists_flag_and_subscribe_for_pm(void)
  	}
  }
  STARTUP(EARLY_BOOT, STARTUP_RANK_MIDDLE, set_awl_scratch_exists_flag_and_subscribe_for_pm);
 +
 +/*
-+ * Orange Pi 5 Plus: the page counters of the beat line (vfree, vspec, vcomp). A bsd object cannot include
++ * Orange Pi 5 Plus: the page counters of the beat line. A bsd object cannot include
 + * <vm/vm_page.h> itself -- the header is not exported, and its kern/misc_protos.h declares setbit(), which
-+ * bsd/sys/param.h already defines as a macro -- so the numbers cross over here.
++ * bsd/sys/param.h already defines as a macro -- so the numbers cross over here. The first three outputs are
++ * the fields the beat line has always printed; the six after them are the jetsam-facing queues (inactive,
++ * active, pageable external, purgeable), the compressor switch and its mode (VM_PAGER_* in vm_pageout.h),
++ * for the round-11 observability fields vinact/vact/vext/vpur/vcact/vcmode. Every output is optional: NULL
++ * skips it, so callers that want only the old three keep paying nothing.
 + */
++#include <vm/vm_pageout.h> /* VM_CONFIG_COMPRESSOR_IS_ACTIVE (vm_pageout.h:666, under KERNEL_PRIVATE, which
++                            * this build defines); the page counters themselves come from vm_page.h, which
++                            * the vm_compressor.h include above already pulled in */
++
 +void
 +opi5plus_vm_page_counts(unsigned long long *free_pages, unsigned long long *speculative_pages,
-+    unsigned long long *compressor_pages)
++    unsigned long long *compressor_pages, unsigned long long *inactive_pages, unsigned long long *active_pages,
++    unsigned long long *pageable_external_pages, unsigned long long *purgeable_pages,
++    unsigned long long *compressor_active, unsigned long long *compressor_mode)
 +{
 +	if (free_pages != NULL) {
 +		*free_pages = vm_page_free_count;
@@ -1928,5 +1986,23 @@ index e9daeed..e4daf1b 100644
 +	}
 +	if (compressor_pages != NULL) {
 +		*compressor_pages = (unsigned long long)VM_PAGE_COMPRESSOR_COUNT;
++	}
++	if (inactive_pages != NULL) {
++		*inactive_pages = vm_page_inactive_count;
++	}
++	if (active_pages != NULL) {
++		*active_pages = vm_page_active_count;
++	}
++	if (pageable_external_pages != NULL) {
++		*pageable_external_pages = vm_page_pageable_external_count;
++	}
++	if (purgeable_pages != NULL) {
++		*purgeable_pages = vm_page_purgeable_count;
++	}
++	if (compressor_active != NULL) {
++		*compressor_active = VM_CONFIG_COMPRESSOR_IS_ACTIVE ? 1 : 0;
++	}
++	if (compressor_mode != NULL) {
++		*compressor_mode = (unsigned long long)vm_compressor_mode;
 +	}
 +}

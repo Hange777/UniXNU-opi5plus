@@ -15,8 +15,9 @@ is real hardware input: no USB device enumerates, because XNU has no USB host st
 `AppleUSBXHCI` are not in the prelink), and a hot-plugged wireless mouse therefore does nothing. Two names earlier
 rounds cited as evidence do not hold: `IOHIDSystem` is not a class of this kernel at all (`evidence/m5/M5-08`), and
 the `XHCI: Initialize DWC3` / `XhcDriverBindingStart` lines are the firmware's own `XhciDxe.efi` printing before
-`DARWINBOOT: hand-off`, so they prove the firmware has USB, not that XNU does. The picture still carries horizontal
-banding inside the large glyphs, and the userland never arms a vsync (`sent=0` in both rounds). Rounds 4-10
+`DARWINBOOT: hand-off`, so they prove the firmware has USB, not that XNU does. At that point the picture still
+carried horizontal banding inside the large glyphs, and the userland never arms a vsync (`sent=0` in every round
+so far). Rounds 4-10
 (2026-11-12) then closed two more lines: **`bluetoothd` is blocked at the exec gate with zero code**
 (`opi5plus-block-exec=bluetoothd`, 268 `exit bluetoothd[` lines in round 3 -> 0 in round 4), and the **SD
 throughput line is finished** — the PIO read path runs at ~11.5 MB/s, 89% of what the card's ~26 MHz 4-bit clock
@@ -33,11 +34,22 @@ queues and free + speculative memory never dropped below ~0.92 GB in any long ru
 compiled in mode 8 (freezer semantics, hence `vcomp 0`, switchable with the boot argument `vm_compressor=2`,
 zero kernel code), and jetsam correctly finds nothing to kill. The next step on this line is observation, not
 a fix: extend the beat line with `vext/vpur/vinact/vact/vcact/vcmode/lsr` to build the jetsam/compressor
-baseline.
+baseline. Round 11 (2026-11-12) did that and closed the display line's copy question in the same boot: the beat
+line now carries the seven fields (`vcmode 8` / `vcact 0` is the compressor baseline a future
+`vm_compressor=2` comparison boot measures against; `lsr` prices card-medium reads by age), and
+**`opi5-gop-mirror=0` made direct scanout the working display path** — zero-copy (`gop 0/158`, every swap
+`0 copies`, no `gop blit` anywhere), the 30 s readback saying `window on a compositor surface` every time it
+prints, latch mean ~14 ms / longest 17.1 ms / 0 over 50 ms, and the board's first frame-rate measurement:
+**50 fps** during the unlock animation. The banding question closed with it — its root cause is CPU writes
+into the (write-combining) scanout buffer (the mirror copy, the early console's writes and the early paints
+are one mechanism; direct scanout removes every producer,
+[`evidence/round11-result.md`](evidence/round11-result.md)) — while the **white blocks remain and are a
+separate defect** (WidgetRenderer rendering an empty surface, the next display-line target).
 `porting.toml`
 marks firmware, cpu, memory, storage and display `implemented` and input `device-verified`; round 3's measurement is
 [`evidence/round3-result.md`](evidence/round3-result.md), round 2's baseline and root cause is
-[`evidence/round2-result.md`](evidence/round2-result.md), round 3's build identity is in
+[`evidence/round2-result.md`](evidence/round2-result.md), round 11's direct-scanout verification is
+[`evidence/round11-result.md`](evidence/round11-result.md), round 3's build identity is in
 [`evidence/round3-baseline/README.md`](evidence/round3-baseline/README.md), and
 [`evidence/HANDOFF.md`](evidence/HANDOFF.md) is the starting point for the next session.
 

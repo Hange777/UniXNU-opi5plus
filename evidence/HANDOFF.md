@@ -1,8 +1,8 @@
-# Handoff - Orange Pi 5 Plus, UniXNU, 2026-11-12 (after round 10)
+# Handoff - Orange Pi 5 Plus, UniXNU, 2026-11-12 (after round 11)
 
 Read `evidence/sd-clock-investigation.md` (rounds 7-10, the SD line's conclusion), then `evidence/round4-6-result.md`
 (rounds 4-6: block-exec, the SD counters, the serial reset key), then `evidence/round3-result.md` for the input
-round these built on. This page is only the rest.
+round these built on, and `evidence/round11-result.md` for the direct-scanout round. This page is only the rest.
 
 ## Where the port stands
 
@@ -22,6 +22,19 @@ Rounds 4-10 (2026-11-12) then measured and closed the two things that were cheap
   CPU; both earlier models (poll volume, batch size) were falsified on the board; the CIU divider is linearly
   effective; and the next 2x is CRU clock-tree work (move the sdmmc source clock to 52 MHz), not driver work
   (`evidence/sd-clock-investigation.md`).
+
+Round 11 (2026-11-12) then made direct scanout the working display path:
+
+* **`opi5-gop-mirror=0` (now the board default in `board.toml`): zero-copy scanout, verified end to end.**
+  `gop 0/158`, every swap `0 copies`, `copy fallbacks 0`, no `gop blit` line anywhere; the 30 s readback says
+  `window on a compositor surface` every time it prints — the window never touches the boot buffer again
+  (`evidence/round11-result.md` S1-S2). Latch mean 13,965 us / longest 17,108 us / 0 over 50 ms; 158 swaps, 0
+  refused; and the first frame-rate measurement on the board: **50 fps** during the unlock animation
+  (busiest second 61, mean gap 19,999 us). The mirror CPU copy this replaces measured 88.6-95.7 ms a frame.
+* **The observation baseline is in.** The beat line now carries `vinact/vact/vext/vpur/vcact/vcmode/lsr`
+  (patch 0002 regenerated): `vcmode 8` / `vcact 0` is the compressor baseline a future `vm_compressor=2`
+  comparison boot measures against, `lsr` prices card-medium reads by age, and the `vfree` floor
+  (~1,576 pages at t+2135) is again XNU's designed steady state, not a copy-path artifact.
 
 ## The infrastructure this session added
 
@@ -60,11 +73,16 @@ Rounds 4-10 (2026-11-12) then measured and closed the two things that were cheap
    the firmware has USB and nothing about XNU; and `IOHIDSystem` is not a class of this kernel at all
    (`evidence/m5/M5-08`), so its `absent` reading carries no information. Next: make the prelink feasibility
    decision for the USB host stack (17 kexts, closure 29) before scheduling it as work.
-2. **Banding inside the large glyphs.** Clean small text, striped clock digits, static screen, so not tearing.
-   Best candidate from round 2: `metal2vulkan-degrade-shadowed-texture` ("a 2D A8Unorm texture of 332x200 ...
-   rows of 352 bytes ... refuses a DRM_FORMAT_MOD_LINEAR image (ERROR_INITIALIZATION_FAILED)"). The GOP copy is
-   byte-complete (pitch 10240 = 2560x4). Round 3 did not revisit it, and the home screen has no large glyph to
-   compare. Next: find the shape the digits use; the one-shot `biplanar surface accepted` line never printed.
+2. **White blocks — the banding is closed, this one is separate.** Round 11 **closed the banding inside the
+   large glyphs**: with `opi5-gop-mirror=0` it is gone, and the early-boot stripes (the Apple-logo phase) plus
+   the mirror copy plus the early paints are one mechanism — CPU writes into the (write-combining) scanout
+   buffer the VOP is concurrently scanning (the early console's own buffer is the scanout buffer,
+   `logs/boot-round11.log:1936` base 0xE6740000 = Esmart2). Direct scanout removes every producer; verdict
+   in `evidence/round11-result.md` S7. The **white blocks (three white rounded rectangles) remain** and are
+   independent of the banding — the round-11 run split them off. They point at WidgetRenderer rendering an
+   empty surface; that is the next display-line target.
+   One pending follow-up on the round-11 state: name the vop-direct teardown branch behind the single
+   t+1595 `back to boot 1` (a transient during unlock session teardown, fallbacks 0, no criterion broken).
 3. **`vsync sent=0 arms=0`** in every vsync line of both rounds, so swaps complete without the userland ever
    arming a vsync — and round 3 unlocked the device the same way. Next: find the caller that arms one, and
    whether the compositor waits at all for a static UI.
@@ -108,10 +126,11 @@ UNIXNU_OUT=/opt/unixnu-out ./unixnu defconfig opi5plus_display_defconfig -D ../U
 UNIXNU_OUT=/opt/unixnu-out UNIXNU_UNIQUE_CHIP_ID=4f504935504c5553 ./unixnu build kernel -D ../UniXNU-opi5plus
 ```
 
-Payload: `wsl -d unixnu -u root -e bash /mnt/d/rk-mac/tools/wsl/tmp-payload-r10.sh` (writes
-`artifacts/m5/payload-round10.img`; one stub per round, `tmp-payload-r4.sh` through `-r10.sh`, each is the record
-of that round's argument list and the only place the round's experiment argument is set — round 10's is
-byte-identical to round 9's except the output paths).
+Payload: since round 11 the regular pack is `tools/wsl/pack-payload.sh` — run as root in the WSL distro from
+`/mnt/d/rk-mac/repos/UniXNU`, `bash /mnt/d/rk-mac/repos/UniXNU-opi5plus/tools/wsl/pack-payload.sh
+<OUTPUT.img>` (writes `artifacts/m5/payload-round11.img` in round 11; no per-round stub and no
+`--kernel-arg`, board.toml is the single argument source; the build step is not inside). The round stubs
+`tmp-payload-r4.sh` through `-r10.sh` remain as the record of those rounds' argument lists.
 
 Board: `powershell -File tools/deploy-payload.ps1 -SkipMaskrom ...` pushes the four payload files over the SD-first
 Linux and then flashes SPI-first. Read its header before running it: a SPI-first board that panics is unreachable.
@@ -127,9 +146,10 @@ the byte — which is why the reset itself never appears in the capture.
 ## Traps that already cost time
 
 * The command line has a **1000-byte ceiling** (`scripts/unixnu/payload.py`), enforced before the volume is
-  written. Round 4 sits at 981 bytes / 53 arguments (round 3: 993 / 54; the round-4 re-shuffle dropped
-  `sd-auto-reboot=3600` and `offline-legacy-paint=0` and added `opi5plus-block-exec=bluetoothd`), so adding an
-  argument still means dropping one.
+  written. Round 4 sat at 981 bytes / 53 arguments (round 3: 993 / 54; the round-4 re-shuffle dropped
+  `sd-auto-reboot=3600` and `offline-legacy-paint=0` and added `opi5plus-block-exec=bluetoothd`); since
+  round 11 it is **985 bytes / 53 arguments** (`sd-trace-io=0` dropped for budget — its default is 0 —
+  `opi5-gop-mirror=0` added), so adding an argument still means dropping one.
 * `prepare-xnu-source.py` restores 26 Apple headers over HTTPS and direct TLS is reset on this network; export the
   proxy above or the build stops there.
 * A leftover `startup.o.json` compile record makes the bootstrap pass skip and `archive-03` fail: move it aside
