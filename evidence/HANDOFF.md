@@ -1,4 +1,4 @@
-# Handoff - Orange Pi 5 Plus, UniXNU, 2026-11-12 (after round 12)
+# Handoff - Orange Pi 5 Plus, UniXNU, 2026-11-12 (after round 13)
 
 Read `evidence/sd-clock-investigation.md` (rounds 7-10, the SD line's conclusion), then `evidence/round4-6-result.md`
 (rounds 4-6: block-exec, the SD counters, the serial reset key), then `evidence/round3-result.md` for the input
@@ -47,6 +47,24 @@ Round 12 (2026-11-12) then closed the attribution half of the white-block line:
   332x200 signature printed **zero times**, and the white-block hypothesis is revised (conjecture) to
   a WidgetRenderer surface-content problem (`evidence/round12-result.md`). The validateSwap rejection
   print is in the payload and stayed untriggered (rej 0 throughout).
+
+Round 13 (2026-11-12) then put the census on the surfaces and pushed the white-block attribution to the
+composition pipeline:
+
+* **The surface census took its first archive, and no scanned surface is a plain white layer.**
+  `opi5-surface-census=1` gives the direct path a ledger (cap 32 surfaces) plus a 30 s per-surface
+  content sample — 25 pixels on a 5x5 grid over the visible rectangle, read-only, after a latch
+  confirms. All 12 census lines logged: three surfaces, all 2560x1440 ARGB stride 10240 —
+  `0x19a631000`/`0x1ab873000` both `backboardd[57]` (lock screen: 24/25 grid points black + 1 white;
+  desktop: mixed) and `0x1bfa4e000` `PerfPowerService[73]` (mixed from the first sample). **No
+  `uniform` line exists anywhere** — so the white the panel shows is **inside the composited frame**
+  (the widget-placeholder region whose content is blank; 1 white point in 25 covers ~1/25 of the
+  panel, the white block's area fraction), and the user's new observation — the App Store icon
+  renders **on top of** the white block — puts the block below the icon layer. The display path is
+  now cleared end to end: direct scanout, 0 copies, 0 fallbacks, and no white layer for it to produce
+  (`evidence/round13-result.md`). Parity: swap ok 175 / rej 0, latch mean 11,829 us, procs 228,
+  injector fails 0; the capture ran its full 2,700 s and **the board stayed in XNU (no 0x1d; quota
+  1/2)**.
 
 ## The infrastructure this session added
 
@@ -104,9 +122,18 @@ Round 12 (2026-11-12) then closed the attribution half of the white-block line:
    were on the panel, and the degrade/failure path is 100% backboardd[57] — nothing in it belongs to
    WidgetRenderer_D. The revised hypothesis (**conjecture**) is a surface-content problem: a
    WidgetRenderer surface is created and handed to the compositor but never rendered into, and the
-   compositor composites the white fallback. Next step: surface-commit/content observation points on
-   the WidgetRenderer_D side (the sampler slot is already in place; the driver side could log the
-   surfaces it binds) — **pending the user's decision** before another board round.
+   compositor composites the white fallback. Round 13's surface census then settled what the display
+   path can and cannot be: **no census surface is a plain white layer** (no `uniform` line in the
+   whole capture), the lock-screen composites read 24/25 grid points black + 1 white (~1/25 of the
+   panel = the block's area fraction), and the white content is **inside the composited frame** — a
+   widget-placeholder layer that exists while its content is blank, composited by backboardd as-is;
+   the App Store icon renders on top of the block (user, confirmed). The display path is cleared end
+   to end (direct scanout, 0 copies, 0 fallbacks, and no white layer for it to produce).
+   **Next step, two options (user decision):** (a) region-level sampling at the white block's
+   user-calibrated coordinates (a handful of targeted pixels instead of the 5x5 grid) to upgrade
+   "the white is inside the surface" to confirmed, or (b) accept the attribution — the white
+   content's origin is the render server's composition pipeline, a userland-side matter — and move
+   to another direction.
    Resolved by source read: the single t+1595 `back to boot 1` is the designed blank-swap path —
    `kickOnce()`'s `surface == nullptr` branch paints the boot buffer black (`directToBoot()` ->
    `flip(bootIova)` -> `fill_pixels 0xff000000`) while the unlock session is torn down and rebuilt, and

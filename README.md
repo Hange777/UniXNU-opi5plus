@@ -51,7 +51,13 @@ separate defect** (WidgetRenderer rendering an empty surface, the next display-l
 `WidgetRenderer_D`: every relay line now carries a pid, the degrade/failure path is 100%
 `backboardd[57]`, the 332x200 signature printed zero times — so the white-block hypothesis is revised
 (conjecture) to a WidgetRenderer surface-content problem, with surface-commit observability as the next
-step pending the user's decision ([`evidence/round12-result.md`](evidence/round12-result.md)).
+step pending the user's decision ([`evidence/round12-result.md`](evidence/round12-result.md)). Round 13
+(2026-11-12) then added the surface census (`opi5-surface-census=1`): the direct path's three surfaces
+are all 2560x1440 ARGB with no plain-white layer among them — the lock-screen composites read 24/25
+grid points black + 1 white (~1/25 of the panel, the white block's area) and the desktop reads mixed —
+so the white content sits **inside the composited frame** (a widget-placeholder layer whose content is
+blank; the App Store icon renders on top of the block), with parity at 175 swaps / 0 copies / latch
+mean 11.8 ms ([`evidence/round13-result.md`](evidence/round13-result.md)).
 `porting.toml`
 marks firmware, cpu and memory `implemented`, and storage, display and input `device-verified`; round 3's measurement is
 [`evidence/round3-result.md`](evidence/round3-result.md), round 2's baseline and root cause is

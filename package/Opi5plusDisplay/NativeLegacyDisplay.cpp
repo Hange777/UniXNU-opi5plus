@@ -126,6 +126,47 @@ static inline uint64_t nativeSourceStride(OSObject *surface,uint32_t width) {
        native_legacy_surface_width(surface)==width)return (uint64_t)width*4;
     return native_legacy_surface_stride(surface);
 }
+// Round-13 white-block census (boot-arg opi5-surface-census=1, parsed in startDirect): the direct path keeps
+// a ledger of every distinct (physical base, width, height, format) surface it maps into a scanout slot --
+// first-seen time, shape, stride and the framebuffer client pid of that moment. native_legacy_client_pid is
+// the LAST client to open the framebuffer (covered on every open), so it names the submitter of the moment,
+// not necessarily the surface's creator. Once per ledger surface per 30 s, sampled from latchTick after a
+// latch has confirmed (1-17 ms after the swap was submitted, the widest window in which the GPU has
+// certainly finished the frame the window now scans), the surface is mapped read-only -- the same map the
+// GOP mirror blits through -- and 25 pixels on a 5x5 grid over the visible rectangle are read; one IOLog
+// line classifies them: uniform white/black/value, near-uniform (2-4 distinct values with their counts),
+// mixed. The census only reads and logs. With the argument absent it is off: the direct path behaves exactly
+// as round 12, the only addition being one false branch per newly mapped slot.
+#define OPI5_CENSUS_PREFIX "opi5plus: display: census: surf pa=%#llx %ux%u fmt=%#x stride=%llu pid=%d age=%llus: "
+struct CensusEntry {
+    uint64_t pa;uint32_t width,height,format;uint64_t stride;
+    int pid;uint64_t firstSeenUs,lastSampleUs;bool unmappable;
+};
+static constexpr unsigned kCensusCap=32;
+static CensusEntry censusEntries[kCensusCap]={};
+static unsigned censusCount=0,censusOverflow=0,censusEnabled=0;
+static uint64_t censusWindowUs=0,censusWindowLines=0;   // soft cap: at most 2 census lines per 5 s
+static void censusRegister(uint64_t pa,uint32_t width,uint32_t height,uint32_t format,uint64_t stride) {
+    for(unsigned k=0;k<censusCount;++k) {
+        const CensusEntry &entry=censusEntries[k];
+        if(entry.pa==pa && entry.width==width && entry.height==height && entry.format==format)return;
+    }
+    if(censusCount>=kCensusCap) {
+        ++censusOverflow;
+        if(censusOverflow==1 || (censusOverflow%256)==0)
+            IOLog("opi5plus: display: census: ledger full (%u surfaces), %llu further surfaces counted only\n",
+                kCensusCap,(unsigned long long)censusOverflow);
+        return;
+    }
+    CensusEntry &entry=censusEntries[censusCount++];
+    entry.pa=pa;entry.width=width;entry.height=height;entry.format=format;entry.stride=stride;
+    entry.pid=native_legacy_client_pid;
+    uint64_t nowNs=0;absolutetime_to_nanoseconds(mach_absolute_time(),&nowNs);
+    entry.firstSeenUs=nowNs/1000;entry.lastSampleUs=0;entry.unmappable=false;
+    IOLog("opi5plus: display: census: registered #%u pa=%#llx %ux%u fmt=%#x stride=%llu pid=%d\n",
+        censusCount,(unsigned long long)pa,(unsigned)width,(unsigned)height,format,
+        (unsigned long long)stride,entry.pid);
+}
 class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
     OSDeclareDefaultStructors(NativeLegacyDisplay)
     IOMemoryMap *bootMapping=nullptr;
@@ -227,6 +268,10 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         unsigned check=0;PE_parse_boot_argn("evb10-vop-fence-check",&check,sizeof(check));
         if(check<1)PE_parse_boot_argn("rk3588-vop-fence-check",&check,sizeof(check));
         fenceCheck=check==1;
+        // Round-13 surface census (default 0 = off): with the argument absent nothing below ever runs and the
+        // direct path is byte-for-byte the round-12 behaviour.
+        unsigned census=0;PE_parse_boot_argn("opi5-surface-census",&census,sizeof(census));
+        censusEnabled=census==1;
         if(fence==1) {
             fenceTimer=IOTimerEventSource::timerEventSource(this,&NativeLegacyDisplay::fenceFired);
             if(fenceTimer && loop->addEventSource(fenceTimer)==kIOReturnSuccess)fenceOn=true;
@@ -294,6 +339,15 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         surface->retain();memory->retain();
         slot={surface,memory,iova,directClock};
         native_legacy_direct[1]=native_legacy_direct[1]+1;
+        // The census ledger (opi5-surface-census=1): the physical base here is directPages[0], the same first
+        // page readback() reports through getPhysicalSegment(0), so the two lines cross-check. The shape is the
+        // surface's own; the stride is the row the copy and mirror read (nativeSourceStride).
+        if(censusEnabled) {
+            uint32_t displayWidth=0,displayHeight=0;getDisplayDimensions(&displayWidth,&displayHeight);
+            censusRegister(directPages[0],(uint32_t)native_legacy_surface_width(surface),
+                (uint32_t)native_legacy_surface_height(surface),native_legacy_surface_format(surface),
+                nativeSourceStride(surface,displayWidth));
+        }
         return pick;
     }
     static void latchFired(OSObject *owner,IOTimerEventSource *) {static_cast<NativeLegacyDisplay *>(owner)->latchTick();}
@@ -379,6 +433,115 @@ class NativeLegacyDisplay : public IOMobileFramebufferLegacy {
         gopMirrorPresent(shownSlot);
         native_legacy_transfer_observed(kIOReturnSuccess,request,latchLength);
         finishTransfer(request,true);
+        // The census beat (opi5-surface-census=1), after the latch confirmed and the frame retired: a sample
+        // reads what the window just scanned, on the work loop like everything else that touches the slots.
+        if(censusEnabled)censusPoll();
+    }
+    // The census beat: walk the mapped slots, find each slot's ledger entry by its (pa,w,h,fmt) tuple and
+    // sample it when its 30 s are up. The soft cap (2 lines per 5 s) is checked per slot; an entry left over
+    // is simply retried on the next latch, which is the queue the cap defers along. Runs on the work loop
+    // only, like all other slot access; the entries and slots are read without locks for the same reason.
+    void censusPoll() {
+        uint64_t nowNs=0;absolutetime_to_nanoseconds(mach_absolute_time(),&nowNs);
+        const uint64_t nowUs=nowNs/1000;
+        if(nowUs-censusWindowUs>=5000000ull){censusWindowUs=nowUs;censusWindowLines=0;}
+        for(unsigned s=0;s<kDirectSlots;++s) {
+            DirectSlot &slot=directSlots[s];
+            if(!slot.surface || !slot.memory)continue;
+            IOByteCount segment=0;
+            const addr64_t pa=slot.memory->getPhysicalSegment(0,&segment,kIOMemoryMapperNone);
+            if(!pa || !segment)continue;
+            CensusEntry *entry=nullptr;
+            for(unsigned k=0;k<censusCount;++k) {
+                CensusEntry &known=censusEntries[k];
+                if(known.pa==(uint64_t)pa && known.width==(uint32_t)native_legacy_surface_width(slot.surface) &&
+                   known.height==(uint32_t)native_legacy_surface_height(slot.surface) &&
+                   known.format==native_legacy_surface_format(slot.surface)){entry=&known;break;}
+            }
+            if(!entry || entry->unmappable)continue;
+            if(nowUs-entry->lastSampleUs<30000000ull)continue;
+            if(censusWindowLines>=2)continue;
+            if(censusSample(slot,*entry,nowUs))++censusWindowLines;
+            entry->lastSampleUs=nowUs;
+        }
+    }
+    // One census sample: map the slot's surface read-only (the same map the GOP mirror blits through), read
+    // 25 pixels on a 5x5 grid over the visible rectangle (an accepted surface is never smaller than the
+    // display, so the grid covers what reaches the panel), classify, log one line. Always logs (the sample
+    // line, or the one-time unmappable line) and always returns true, so the caller counts it against the
+    // soft cap and stamps the entry's last-sample time either way.
+    bool censusSample(const DirectSlot &slot,CensusEntry &entry,uint64_t nowUs) {
+        const uint64_t stride=entry.stride;
+        const uint64_t ageS=nowUs>=entry.firstSeenUs?(nowUs-entry.firstSeenUs)/1000000ull:0;
+        uint32_t displayWidth=0,displayHeight=0;getDisplayDimensions(&displayWidth,&displayHeight);
+        const uint32_t viewWidth=displayWidth && displayWidth<entry.width?displayWidth:entry.width;
+        const uint32_t viewHeight=displayHeight && displayHeight<entry.height?displayHeight:entry.height;
+        // The extent the grid touches: the last row's last pixel. A stride that is not a whole word, a zero
+        // view, or a mapping shorter than the grid refuses the sample the way the mirror refuses a blit.
+        const uint64_t needed=stride?((uint64_t)viewHeight-1)*stride+(uint64_t)(viewWidth-1)*4+4:0;
+        IOMemoryMap *source=slot.memory->map(kIOMapAnywhere|kIOMapReadOnly);
+        if(!source || !source->getVirtualAddress() || !needed || (stride&3) || source->getLength()<needed) {
+            OSSafeReleaseNULL(source);
+            entry.unmappable=true;
+            IOLog(OPI5_CENSUS_PREFIX "unmappable\n",
+                (unsigned long long)entry.pa,(unsigned)entry.width,(unsigned)entry.height,entry.format,
+                (unsigned long long)stride,entry.pid,(unsigned long long)ageS);
+            return true;
+        }
+        const volatile uint32_t *pixels=reinterpret_cast<const volatile uint32_t *>(source->getVirtualAddress());
+        const uint64_t rowWords=stride/4;
+        uint32_t distinct[25]={};uint32_t counts[25]={};unsigned kinds=0;
+        for(unsigned iy=0;iy<5;++iy) {
+            const uint64_t y=iy==4?viewHeight-1:(uint64_t)viewHeight*iy/4;
+            for(unsigned ix=0;ix<5;++ix) {
+                const uint64_t x=ix==4?viewWidth-1:(uint64_t)viewWidth*ix/4;
+                const uint32_t value=pixels[y*rowWords+x];
+                unsigned k=0;
+                while(k<kinds && distinct[k]!=value)++k;
+                if(k<kinds)++counts[k];
+                else if(kinds<25){distinct[kinds]=value;counts[kinds]=1;++kinds;}
+                else ++counts[24];   // unreachable with 25 samples; kept for the bound
+            }
+        }
+        OSSafeReleaseNULL(source);
+        if(kinds==1) {
+            if(distinct[0]==0xffffffffU) {
+                IOLog(OPI5_CENSUS_PREFIX "uniform 0xffffffff (white)\n",
+                    (unsigned long long)entry.pa,(unsigned)entry.width,(unsigned)entry.height,entry.format,
+                    (unsigned long long)stride,entry.pid,(unsigned long long)ageS);
+                return true;
+            }
+            if(distinct[0]==0xff000000U) {
+                IOLog(OPI5_CENSUS_PREFIX "uniform 0xff000000 (black)\n",
+                    (unsigned long long)entry.pa,(unsigned)entry.width,(unsigned)entry.height,entry.format,
+                    (unsigned long long)stride,entry.pid,(unsigned long long)ageS);
+                return true;
+            }
+            IOLog(OPI5_CENSUS_PREFIX "uniform 0x%08x\n",
+                (unsigned long long)entry.pa,(unsigned)entry.width,(unsigned)entry.height,entry.format,
+                (unsigned long long)stride,entry.pid,(unsigned long long)ageS,distinct[0]);
+            return true;
+        }
+        if(kinds==2)
+            IOLog(OPI5_CENSUS_PREFIX "near-uniform n=2: 0x%08x*%u 0x%08x*%u\n",
+                (unsigned long long)entry.pa,(unsigned)entry.width,(unsigned)entry.height,entry.format,
+                (unsigned long long)stride,entry.pid,(unsigned long long)ageS,
+                distinct[0],counts[0],distinct[1],counts[1]);
+        else if(kinds==3)
+            IOLog(OPI5_CENSUS_PREFIX "near-uniform n=3: 0x%08x*%u 0x%08x*%u 0x%08x*%u\n",
+                (unsigned long long)entry.pa,(unsigned)entry.width,(unsigned)entry.height,entry.format,
+                (unsigned long long)stride,entry.pid,(unsigned long long)ageS,
+                distinct[0],counts[0],distinct[1],counts[1],distinct[2],counts[2]);
+        else if(kinds==4)
+            IOLog(OPI5_CENSUS_PREFIX "near-uniform n=4: 0x%08x*%u 0x%08x*%u 0x%08x*%u 0x%08x*%u\n",
+                (unsigned long long)entry.pa,(unsigned)entry.width,(unsigned)entry.height,entry.format,
+                (unsigned long long)stride,entry.pid,(unsigned long long)ageS,
+                distinct[0],counts[0],distinct[1],counts[1],distinct[2],counts[2],distinct[3],counts[3]);
+        else
+            IOLog(OPI5_CENSUS_PREFIX "mixed n=%u\n",
+                (unsigned long long)entry.pa,(unsigned)entry.width,(unsigned)entry.height,entry.format,
+                (unsigned long long)stride,entry.pid,(unsigned long long)ageS,kinds);
+        return true;
     }
     // Back to the boot loader's memory (the blank frame and the copy are drawn there).
     void directToBoot() {

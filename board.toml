@@ -304,6 +304,16 @@ kernel_args = [
   #   88-96 ms/frame; 0 lets the VOP window stay on the compositor surface -- upstream orangepi5 behavior,
   #   latch ~6.4 ms. Flip back to 1 if the panel goes stale.
   "opi5-gop-mirror=0",
+  # opi5-surface-census=1  round-13 white-block census. Parser: package/Opi5plusDisplay/
+  #   NativeLegacyDisplay.cpp:273 (startDirect, default 0 = off). The direct path keeps a ledger of every
+  #   surface it scans (:347: first-seen time, shape, format, stride, the client pid of that moment) and
+  #   samples each one once per 30 s (:438, right after a latch confirms, so the GPU had the 1-17 ms since
+  #   the swap to finish): a read-only map -- the same one the GOP mirror blits through -- plus 25 pixels on
+  #   a 5x5 grid over the visible rectangle, one IOLog line each: uniform white/black/value, near-uniform
+  #   (n, with per-value counts) or mixed. A white block area reading "uniform 0xffffffff" puts the white in
+  #   the compositor's layer (content side); anything else points further along the display path. Read-only
+  #   diagnostics; with the argument absent the direct path is exactly round 12.
+  "opi5-surface-census=1",
   # --- console mirror: no parser in this repository ---------------------------------------------------
   # vc_mirror is not a base XNU argument: the EVB10 gets it from its own patches/xnu/evb10-vc-mirror.patch
   # (osfmk/console/serial_console.c, pexpert/arm/pe_init.c). Nothing in this repository's patches/xnu/
