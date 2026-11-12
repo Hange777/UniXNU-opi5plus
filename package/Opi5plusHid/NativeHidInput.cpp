@@ -7,10 +7,15 @@
 //    below are the panel's and the edge band is 24 panel pixels (12 pt at the 540 x 960 pt the display runs at);
 //  - this board has no hardware buttons driver, so the weak button sink is gone (nothing else of the class or its vtable changed:
 //    scripts/build-evb10-hid.py audits the same ten overridden slots).
+//  - 2026-11-13 (S2): the USB HID mailbox consumer of UniXNU-orangepi5's Evb10Hid (pin 729ba25f) is merged in:
+//    the weak native_usb_* externs, mouseDescriptor, usbHidFlush()/mouseFlush() and the mouseOnly device form
+//    (native_hid_mouse_allocate). The injector (opi5-hid-input>=2) and every report it emits are unchanged.
 #include "OriginalHidDeviceABI.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/IOTimerEventSource.h>
+#include <kern/clock.h>
+#include <mach/mach_time.h>
 #include <libkern/c++/OSString.h>
 #include <libkern/c++/OSIterator.h>
 extern "C" uint32_t evb10_fb_w,evb10_fb_h;   // the kernel's own frame buffer (0 without one), xnu-patches/userland-mounts
@@ -23,6 +28,20 @@ extern "C" void native_touch_set_sink(void (*)(void *), void *);   // package/Ev
 extern "C" {
 extern volatile uint32_t native_touch_seq, native_touch_count, native_touch_hid_reports;
 extern volatile int native_touch_xs[12], native_touch_ys[12], native_touch_ids[12];
+// package/Opi5plusUsb: boot-protocol HID mailbox (weak when USB is not linked, the declaration form
+// package/LegacyDisplayProbe.cpp uses for opi5_usb_start). The names are the S1 producer's
+// (package/Opi5plusUsb/NativeUsb.cpp:40-50): kbd_seq / mouse_seq bump on every report, kbd[8] /
+// mouse[4] keep the newest report's bytes, and mouse_dx/dy/wheel accumulate the motion between
+// consumer takes. The producer's own diagnostics (native_usb_mouse_wheel_total,
+// native_usb_mouse_report_protocol) are not consumed here, as upstream's consumer does not either.
+extern volatile uint32_t native_usb_hid_reports __attribute__((weak_import));
+extern volatile uint32_t native_usb_kbd_seq __attribute__((weak_import));
+extern volatile uint8_t native_usb_kbd[8] __attribute__((weak_import));
+extern volatile uint32_t native_usb_mouse_seq __attribute__((weak_import));
+extern volatile uint8_t native_usb_mouse[4] __attribute__((weak_import));
+extern volatile int32_t native_usb_mouse_dx __attribute__((weak_import));
+extern volatile int32_t native_usb_mouse_dy __attribute__((weak_import));
+extern volatile int32_t native_usb_mouse_wheel __attribute__((weak_import));
 }
 // Keyboard Application collection ensures the original generic keyboard
 // personality can match. Report 2 carries the Consumer buttons, bit 0 Menu (Home),
@@ -38,6 +57,23 @@ static const unsigned char descriptor[]={
     0x85,0x02,0x05,0x0c,0x09,0x40,0x09,0x30,0x09,0xe9,0x09,0xea,0x15,0x00,0x25,0x01,
     0x75,0x01,0x95,0x04,0x81,0x02,
     0x75,0x04,0x95,0x01,0x81,0x03,0xc0
+};
+// The USB mouse (package/Opi5plusUsb) is a device of its own, as it is on hardware: backboardd and the HID event system tell a pointing
+// device by the primary usage of the service (Generic Desktop / Mouse), and a mouse collection behind the keyboard's would make the
+// service a keyboard. Report 4: three buttons, X, Y, wheel (relative, one byte each), the layout of a boot mouse report plus the wheel.
+//
+// The original kernel has no event driver personality for a pointer: a Mouse collection matches only the DriverKit
+// AppleUserHIDEventDriver (IOProbeScore 0x4b1, IOUserClass of AppleUserHIDDrivers.dext), which then waits 120 s for a dext process that
+// driverkitd never starts ("DK: ... user server timeout"): the reports were accepted by handleReport and no event ever came out (EVB10
+// board, 2026-11-05). Opi5plusHidProbe's addKernelPointerPersonality adds a personality of the original IOHIDEventDriver (kernel) for
+// USB pointers with a higher score.
+static const unsigned char mouseDescriptor[]={
+    0x05,0x01,0x09,0x02,0xa1,0x01,0x85,0x04,
+    0x09,0x01,0xa1,0x00,
+    0x05,0x09,0x19,0x01,0x29,0x03,0x15,0x00,0x25,0x01,0x95,0x03,0x75,0x01,0x81,0x02,
+    0x95,0x01,0x75,0x05,0x81,0x03,
+    0x05,0x01,0x09,0x30,0x09,0x31,0x09,0x38,0x15,0x81,0x25,0x7f,0x75,0x08,0x95,0x03,0x81,0x06,
+    0xc0,0xc0
 };
 // Report 3: ten-finger Touch Screen collection (Tip Switch, Touch Valid, Contact Identifier, X, Y per finger, then Contact Count).
 // Touch Valid (0x47) is the finger confidence: IOHIDEventDriver turns a finger transducer whose value is 0 into a hand (palm), which
@@ -138,8 +174,22 @@ class NativeHidInput : public IOHIDDevice {
     // The digitizer is a separate service from the keyboard: backboardd matches digitizers by primary usage page/usage
     // (Digitizer/Touch Screen) and the Built-In flag, which a combined keyboard-first descriptor would not provide.
     bool touchOnly=false;
+    // The USB mouse device (native_hid_mouse_allocate): a service of its own with the report 4 descriptor.
+    bool mouseOnly=false;
     bool eventDriverFound=false;
     uint32_t lastSeq=0;
+    // The USB HID mailbox (package/Opi5plusUsb): the last keyboard / mouse sequence numbers this device handed to
+    // handleReport, and what the mouse side has handed on, for the ~5 s log line of mouseFlush.
+    uint32_t lastUsbKbdSeq=0,lastUsbMouseSeq=0;
+    uint32_t ticks=0,mouseReports=0,mouseLogged=0;
+    uint32_t realReports=0,realMoves=0,sumDx=0,sumDy=0;   // what the USB mouse sent, as handed to the event driver
+    unsigned char lastRaw[4]={};
+    IOReturn lastMouseResult=0;
+    // opi5-mouse-demo=SECS: when the kernel has been up SECS seconds this device sends its own square walk (and opi5-mouse-click=1 a
+    // button press at each corner, 2 a long press after each lap, 3 a drag: the button held all the way round), so a pointer can be
+    // looked for on the screen without a person at the mouse. 0 = off.
+    uint32_t demoSecs=0,demoClick=0,demoWheel=0,demoStartTick=0;
+    bool demoStarted=false;   // opi5-mouse-wheel=1 (with the demo): no walk, a burst of 30 wheel counts every 2.5 s, four bursts one way then four the other; =2: a count every tick, 10 s one way, 10 s the other, the pointer jiggling; =3: the same with the pointer walking its square; =4: the pointer goes to the left edge and then +4 a tick for 100 ticks, the wheel from tick 300; =5: to the bottom left (the bottom edge takes iPadOS Home), up and right, a click, then the wheel in growing blocks.
     // Fingers sent as down in the previous report; a vanished identifier gets one explicit tip-up report.
     int prevIds[TOUCH_FINGERS]={-1,-1,-1,-1,-1,-1,-1,-1,-1,-1};
     int prevX[TOUCH_FINGERS]={},prevY[TOUCH_FINGERS]={};
@@ -373,11 +423,123 @@ class NativeHidInput : public IOHIDDevice {
         injectCount(emitButtonReport(0x01));   // bit 0: Menu (Home)
         source->setTimeoutMS(150);
     }
+    // The USB HID mailbox (package/Opi5plusUsb), once per tick. The keyboard side sends report 1 whenever
+    // kbd_seq moved; the mouse side is mouseFlush below. No mailbox access happens while the address of the
+    // weak symbol is 0 (USB not linked) or no event driver has attached (nothing would consume the report).
+    void usbHidFlush() {
+        if(mouseOnly){mouseFlush();return;}
+        if(!&native_usb_kbd_seq || !hasEventDriverCached())return;
+        const uint32_t kseq=native_usb_kbd_seq;
+        if(kseq!=lastUsbKbdSeq) {
+            lastUsbKbdSeq=kseq;
+            unsigned char report[9]={1};
+            for(unsigned i=0;i<8;++i)report[1+i]=native_usb_kbd[i];
+            IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
+            IOReturn result=buffer?handleReport(buffer,0,0):kIOReturnNoMemory;
+            OSSafeReleaseNULL(buffer);
+            native_hid_input_observed(7,result);
+        }
+    }
+    // The mouse device: report 4 (buttons, dx, dy, wheel) for every report the USB driver published.
+    void mouseFlush() {
+        if(!&native_usb_mouse_seq || !hasEventDriverCached())return;
+        const uint32_t mseq=native_usb_mouse_seq;
+        // The motion of every report since the last tick (the USB driver adds them up), at most +-127 per report: what is left goes out
+        // with the next tick. The buttons are the newest report's.
+        auto take=[](volatile int32_t *total)->signed char {
+            const int32_t value=__atomic_load_n(total,__ATOMIC_RELAXED);
+            const int32_t part=value>127?127:(value<-127?-127:value);
+            if(part)__atomic_fetch_sub(total,part,__ATOMIC_RELAXED);
+            return (signed char)part;
+        };
+        const signed char dx=take(&native_usb_mouse_dx),dy=take(&native_usb_mouse_dy),wheel=take(&native_usb_mouse_wheel);
+        if(mseq!=lastUsbMouseSeq || dx || dy || wheel) {
+            lastUsbMouseSeq=mseq;
+            unsigned char report[5]={4,native_usb_mouse[0],(unsigned char)dx,(unsigned char)dy,(unsigned char)wheel};
+            ++realReports;if(dx||dy)++realMoves;
+            sumDx+=dx<0?-dx:dx;sumDy+=dy<0?-dy:dy;
+            for(unsigned i=0;i<4;++i)lastRaw[i]=native_usb_mouse[i];
+            IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
+            lastMouseResult=buffer?handleReport(buffer,0,0):kIOReturnNoMemory;
+            OSSafeReleaseNULL(buffer);
+            ++mouseReports;
+            native_hid_input_observed(7,lastMouseResult);
+        }
+        if(demoSecs && !demoStarted) {   // the demo starts when the kernel has been up demoSecs seconds (the ticks only begin when the event driver is found, which is later)
+            uint64_t ns=0;
+            absolutetime_to_nanoseconds(mach_absolute_time(),&ns);
+            if(ns>=(uint64_t)demoSecs*1000000000ull){demoStarted=true;demoStartTick=ticks;printf("opi5: hid: mouse: demo starts (up %llu s, wheel mode %u)\n",(unsigned long long)(ns/1000000000ull),demoWheel);}
+        }
+        if(demoStarted) {   // one 8 ms tick = one report; 80 ticks a side, 6 counts a tick
+            const uint32_t t=ticks-demoStartTick;
+            const signed char step=6;
+            signed char dx=0,dy=0;
+            // opi5-mouse-click=2: after every lap of the square the button is held down 150 ticks (1.2 s) without moving, a long press
+            const uint32_t cycle=demoClick==2?470:320,c=t%cycle;
+            unsigned char buttons=0;
+            if(c<320){
+                switch((c/80)&3){case 0:dx=step;break;case 1:dy=step;break;case 2:dx=-step;break;default:dy=-step;break;}
+                buttons=demoClick==3?1:(demoClick==1 && (c%80)>=70)?1:0;   // 1: pressed for the last 80 ms of every side; 3: held down the whole walk (a drag)
+            }else buttons=1;
+            signed char wheel=0;
+            if(demoWheel){   // 30 counts in 240 ms, then nothing for 2.26 s: four bursts one way (9.9 s), four the other
+                // The pointer needs a position before a scroll goes anywhere (backboardd routes it by where the pointer is): a nudge of 2 counts before each burst, back after it.
+                if(demoWheel!=3)dx=dy=0;
+                buttons=0;
+                if(demoWheel==4){   // 4: to the left edge (the screen clamps it; not the corner: the top left one opens the Notification Center), then 100 ticks of +4 to the right (about 450 px), and the wheel runs (10 s one way, 10 s the other)
+                    if(t<60)dx=-127;
+                    else if(t<160)dx=4;
+                    if(t>=300)wheel=(((t-300)/1250)&1)?-1:1;
+                }else if(demoWheel==5){   // 5: to the bottom left, then up and right (+4,-4) 85 ticks (about 390 px each way: the Notifications row of the Settings sidebar), a click of 80 ms there at tick 260,
+                    // and from tick 300 the wheel in blocks of 500 ticks (4 s) that grow: +1, -2, +4, -8, +16, -32 counts a tick (a threshold or a rounding in the scroll path would show as the first block that scrolls)
+                    if(t<60)dx=-127;
+                    else if(t<120)dy=127;
+                    else if(t<205){dx=4;dy=-4;}
+                    if(t>=260 && t<270)buttons=1;
+                    if(t>=300){const uint32_t b=(t-300)/500;if(b<6){const int m=1<<b;wheel=(signed char)((b&1)?-m:m);}}
+                }else if(demoWheel==2 || demoWheel==3){   // continuous: one count a tick for 10 s one way, 10 s the other; 2: the pointer jiggles a count to and fro, 3: it walks the square
+                    wheel=((t/1250)&1)?-1:1;
+                    if(demoWheel==2)dx=(t&1)?1:-1;
+                }else{
+                    const uint32_t p=t%310;
+                    if(p==0)dx=2;
+                    else if(p==40)dx=-2;
+                    if(p>=5 && p<35)wheel=((t/1240)&1)?-1:1;
+                }
+            }
+            unsigned char report[5]={4,buttons,(unsigned char)dx,(unsigned char)dy,(unsigned char)wheel};
+            IOBufferMemoryDescriptor *buffer=IOBufferMemoryDescriptor::withBytes(report,sizeof(report),kIODirectionNone);
+            lastMouseResult=buffer?handleReport(buffer,0,0):kIOReturnNoMemory;
+            OSSafeReleaseNULL(buffer);
+            ++mouseReports;
+        }
+        // About every five seconds while the mouse is moving: what became of the reports. Board form of
+        // upstream's log: the mouse-side counters only (this board's edge:: wrapper does not capture
+        // dispatched event types or Pointer samples, and the registry tree dump is not ported).
+        if(++ticks%625==0 && mouseReports!=mouseLogged) {
+            mouseLogged=mouseReports;
+            printf("opi5: hid: mouse: %u reports to handleReport, last result 0x%x\n",mouseReports,(unsigned)lastMouseResult);
+            printf("opi5: hid: mouse: USB reports handed on %u, with motion %u, sum |dx| %u |dy| %u, newest raw %02x %02x %02x %02x\n",
+                   realReports,realMoves,sumDx,sumDy,lastRaw[0],lastRaw[1],lastRaw[2],lastRaw[3]);
+        }
+    }
     static void tick(OSObject *owner,IOTimerEventSource *source) {
         NativeHidInput *self=OSDynamicCast(NativeHidInput,owner);if(!self)return;
         native_hid_live_checkpoint(self);
+        // The USB HID mailbox: report 1 for a moved keyboard report, report 4 for the accumulated mouse
+        // motion. On the injector device (opi5-hid-input>=2) this rides the injector's own tick -- 1 s
+        // while it waits, 20 ms inside a gesture; the separate mouse device re-arms 8 ms below, which is
+        // the cadence the mailbox accumulators were sized for.
+        self->usbHidFlush();
         if(self->injectMode) {self->injectTick(source);return;}
+        if(self->mouseOnly){source->setTimeoutMS(8);return;}
         if(self->touchOnly){source->setTimeoutMS(1000);return;}
+        // Prefer a short tick while USB HID may deliver reports; fall back to the
+        // auto-Home probe when nothing is plugged in.
+        if(&native_usb_kbd_seq || &native_usb_mouse_seq) {
+            source->setTimeoutMS(8);
+            if(!self->down && !native_hid_input_requested())return;
+        }
         if(!self->down && !hasEventDriver(self,4)) {
             native_hid_input_observed(3,0);
             source->setTimeoutMS(1000);
@@ -397,14 +559,16 @@ class NativeHidInput : public IOHIDDevice {
     }
 public:
     void setTouchOnly() {touchOnly=true;}
+    void setMouseOnly() {mouseOnly=true;}
     IOWorkLoop *getWorkLoop() const override {return inputLoop;}
-    OSString *newTransportString() const override {return OSString::withCString(touchOnly?"SPI":"Virtual");}
-    OSString *newProductString() const override {return OSString::withCString(touchOnly?"Offline touch digitizer":"Offline HID input probe");}
+    OSString *newTransportString() const override {return OSString::withCString(touchOnly?"SPI":(mouseOnly?"USB":"Virtual"));}
+    OSString *newProductString() const override {return OSString::withCString(touchOnly?"Offline touch digitizer":(mouseOnly?"USB Mouse":"Offline HID input probe"));}
     IOReturn newReportDescriptor(IOMemoryDescriptor **out) const override {
         if(!out)return kIOReturnBadArgument;
         unsigned char combined[sizeof(descriptor)+sizeof(touchDescriptor)];
         size_t size;
         if(touchOnly){size=sizeof(touchDescriptor);memcpy(combined,touchDescriptor,size);}
+        else if(mouseOnly){size=sizeof(mouseDescriptor);memcpy(combined,mouseDescriptor,size);}
         else{
             size=sizeof(descriptor);memcpy(combined,descriptor,size);
             // Default: one device, keyboard collection first, digitizer second (the arrangement whose event driver
@@ -417,16 +581,21 @@ public:
     bool start(IOService *provider) override {
         inputLoop=IOWorkLoop::workLoop();if(!inputLoop)return false;
         // The probe parsed opi5-hid-input/evb10-hid-input before it allocated this device: 2 and above also inject. A separate
-        // digitizer device (sheng-touch-split) is never an injector.
-        injectMode=native_hid_input_mode>=2 && !touchOnly;
+        // digitizer device (sheng-touch-split) is never an injector, and neither is the USB mouse device.
+        injectMode=native_hid_input_mode>=2 && !touchOnly && !mouseOnly;
         // Request the normal generic HID event personality for this owned
         // keyboard. This is a matching property, not a client entitlement.
         if(!setProperty("HIDDefaultBehavior",true))return false;
         unsigned touch=0;
-        touchEnabled=PE_parse_boot_argn("sheng-touch-hid",&touch,sizeof(touch)) && touch==1;
+        touchEnabled=!mouseOnly && PE_parse_boot_argn("sheng-touch-hid",&touch,sizeof(touch)) && touch==1;   // the mouse is no digitizer
         // The injector sends report 3, so the descriptor has to carry the Touch Screen collection. IOHIDDevice::start below
         // is what asks this class for newReportDescriptor, so the flag must be set by then, not after the start returns.
         if(injectMode)touchEnabled=true;
+        if(mouseOnly) {   // the demo boot arguments (see the members above): all default 0 = off
+            PE_parse_boot_argn("opi5-mouse-demo",&demoSecs,sizeof(demoSecs));
+            PE_parse_boot_argn("opi5-mouse-click",&demoClick,sizeof(demoClick));
+            PE_parse_boot_argn("opi5-mouse-wheel",&demoWheel,sizeof(demoWheel));
+        }
         // DigitizerCollectionDispatch: IOHIDEventDriver (setDigitizerProperties) reads it up the service plane and then sends each
         // report's fingers as one digitizer collection with a child per finger. Without it a touch screen gets one event per finger,
         // and backboardd takes each as the whole touch set, so no two fingers are ever down together for UIKit (no pinch, no
@@ -478,3 +647,4 @@ void *NativeHidInput::operator new(size_t size) {return OSObject::operator new(s
 void NativeHidInput::operator delete(void *mem,size_t size) {return OSObject::operator delete(mem,size);}
 extern "C" IOService *native_hid_input_allocate(void) {return new NativeHidInput;}
 extern "C" IOService *native_hid_touch_allocate(void) {NativeHidInput *device=new NativeHidInput;if(device)device->setTouchOnly();return device;}
+extern "C" IOService *native_hid_mouse_allocate(void) {NativeHidInput *device=new NativeHidInput;if(device)device->setMouseOnly();return device;}

@@ -84,7 +84,14 @@ CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y
 #                  fence hooks: without the archive those are undefined, and the inert stubs that used
 #                  to stand in for them are gone. scripts/build-mali-firmware.py has to make
 #                  package/Mali/mali_csffw.inc first (the firmware is not committed).
-CONFIG_XNU_EXTRA_LD_ARCHIVES="-Wl,-force_load,{tree}/build/link-stubs/libLinkStubs.a -Wl,-force_load,{tree}/build/native-sd/libNativeSd.a -Wl,-force_load,{tree}/build/rk3588-vop-direct/libRk3588VopDirect.a -Wl,-force_load,{tree}/build/opi5-hid/libOpi5plusHid.a -Wl,-force_load,{tree}/build/mali/libMali.a"
+# libOpi5plusUsb.a the polled OHCI USB host + boot HID mailbox (package/Opi5plusUsb, compiled by
+#                  build-opi5plus-drivers.py Opi5plusUsb and archived by scripts/build-opi5plus-usb.py).
+#                  Force-loaded so its native_usb_* mailbox symbols exist for the weak references in
+#                  package/LegacyDisplayProbe.cpp (opi5_usb_start) and package/Opi5plusHid
+#                  (+ Opi5plusHidProbe.cpp). The host thread only runs with the opi5-usb=N boot argument,
+#                  which the S3 build stage adds per payload variant (board.toml kernel_args does not
+#                  carry it yet), so with the argument absent the driver is linked and inert.
+CONFIG_XNU_EXTRA_LD_ARCHIVES="-Wl,-force_load,{tree}/build/link-stubs/libLinkStubs.a -Wl,-force_load,{tree}/build/native-sd/libNativeSd.a -Wl,-force_load,{tree}/build/rk3588-vop-direct/libRk3588VopDirect.a -Wl,-force_load,{tree}/build/opi5-hid/libOpi5plusHid.a -Wl,-force_load,{tree}/build/mali/libMali.a -Wl,-force_load,{tree}/build/opi5plus-usb/libOpi5plusUsb.a"
 
 # --- kernel facilities the port expects ----------------------------------------------------------------
 # 4 KiB signature hashes derived from verified 16 KiB blocks; no archive, no hardware assumption.

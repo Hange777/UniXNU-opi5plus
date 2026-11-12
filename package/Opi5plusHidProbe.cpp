@@ -7,20 +7,33 @@
 //
 //   opi5-hid-input=1 (or evb10-hid-input=1)  start NativeHidInput (keyboard + touch screen HID for backboardd)
 //   opi5-hid-input=2 (or evb10-hid-input=2)  the same, plus the synthetic swipe/Home injector in NativeHidInput::tick
+//   opi5-usb=<N>          package/Opi5plusUsb feeds the native_usb_* mailbox this probe's devices consume: whenever
+//                         the USB driver is linked (the weak native_usb_mouse_seq address test), a mouse device is
+//                         added next to the keyboard and addKernelPointerPersonality gives the original
+//                         IOHIDEventDriver the match for USB pointers. Without the USB driver nothing of it runs.
 //   sheng-touch-hid=1     give it the touch screen collection (read by NativeHidInput::start)
 //   sheng-touch-split=1   a separate digitizer device as well (default: one combined device)
 //   offline-hid-auto-home=<s> [-count N] [-interval s]   unattended Home presses after the second presented frame
 #include <IOKit/IOService.h>
 #include <IOKit/IOLib.h>
+#include <IOKit/IOCatalogue.h>
 #include <libkern/c++/OSMetaClass.h>
 #include <libkern/c++/OSSymbol.h>
 #include <libkern/c++/OSIterator.h>
+#include <libkern/c++/OSArray.h>
+#include <libkern/c++/OSDictionary.h>
+#include <libkern/c++/OSNumber.h>
+#include <libkern/c++/OSString.h>
 #include <pexpert/pexpert.h>
 #include <mach/kmod.h>
 extern kmod_info_t g_kernel_kmod_info;
 extern "C" void native_hid_static_init(void) __asm__("__GLOBAL__sub_I_NativeHidInput.cpp");
 extern "C" IOService *native_hid_input_allocate(void);
 extern "C" IOService *native_hid_touch_allocate(void);
+extern "C" IOService *native_hid_mouse_allocate(void);
+// package/Opi5plusUsb: weak, so the file still links without the USB driver (the declaration form
+// package/LegacyDisplayProbe.cpp uses for opi5_usb_start).
+extern "C" volatile uint32_t native_usb_mouse_seq __attribute__((weak_import));
 extern "C" {
 // How far opi5-hid-input/evb10-hid-input asks the input path to go: 0 = not enabled, 1 = the HID device only (round 2's
 // behaviour), >=2 = the device and its synthetic gesture injector. Written here before NativeHidInput is allocated or
@@ -106,6 +119,37 @@ __attribute__((noinline)) void native_hid_live_checkpoint(IOService *device) {
 void native_hid_input_observed(unsigned event,int result) {
     if(event<8){native_hid_input_events[event]=native_hid_input_events[event]+1;native_hid_input_results[event]=result;}
 }
+// The original kernel matches a pointer (Generic Desktop Mouse / Pointer) only with the DriverKit AppleUserHIDEventDriver (score 0x4b1),
+// whose dext driverkitd does not start here, so the interface of a mouse gets an event service that never works. A personality of the
+// original IOHIDEventDriver (the class the keyboard and the digitizer use) for USB pointers, with a higher score, wins that match;
+// the class parses the mouse's elements itself (X, Y, wheel, buttons) and dispatches Pointer / Scroll / Button events.
+static bool addKernelPointerPersonality(void) {
+    OSDictionary *personality=OSDictionary::withCapacity(8);
+    OSArray *pairs=OSArray::withCapacity(2);
+    if(!personality || !pairs){OSSafeReleaseNULL(personality);OSSafeReleaseNULL(pairs);return false;}
+    for(unsigned usage=1;usage<=2;++usage) {
+        OSDictionary *pair=OSDictionary::withCapacity(2);
+        OSNumber *page=OSNumber::withNumber((unsigned long long)1,32),*use=OSNumber::withNumber((unsigned long long)usage,32);
+        if(pair && page && use){pair->setObject("DeviceUsagePage",page);pair->setObject("DeviceUsage",use);pairs->setObject(pair);}
+        OSSafeReleaseNULL(pair);OSSafeReleaseNULL(page);OSSafeReleaseNULL(use);
+    }
+    OSString *bundle=OSString::withCString("com.apple.iokit.IOHIDFamily"),*klass=OSString::withCString("IOHIDEventDriver"),
+             *provider=OSString::withCString("IOHIDInterface"),*category=OSString::withCString("IODefaultMatchCategory"),
+             *transport=OSString::withCString("USB"),*behavior=OSString::withCString("");
+    OSNumber *score=OSNumber::withNumber((unsigned long long)0x500,32);
+    bool ok=bundle && klass && provider && category && transport && behavior && score && pairs->getCount()==2;
+    if(ok) {
+        personality->setObject("CFBundleIdentifier",bundle);personality->setObject("IOClass",klass);personality->setObject("IOProviderClass",provider);
+        personality->setObject("IOMatchCategory",category);personality->setObject("IOProbeScore",score);personality->setObject("Transport",transport);
+        personality->setObject("HIDDefaultBehavior",behavior);personality->setObject("DeviceUsagePairs",pairs);
+        OSArray *drivers=OSArray::withCapacity(1);
+        ok=drivers && drivers->setObject(personality) && gIOCatalogue && gIOCatalogue->addDrivers(drivers,true);
+        OSSafeReleaseNULL(drivers);
+    }
+    OSSafeReleaseNULL(bundle);OSSafeReleaseNULL(klass);OSSafeReleaseNULL(provider);OSSafeReleaseNULL(category);OSSafeReleaseNULL(transport);
+    OSSafeReleaseNULL(behavior);OSSafeReleaseNULL(score);OSSafeReleaseNULL(pairs);OSSafeReleaseNULL(personality);
+    return ok;
+}
 // The input device(s), on the IOHIDResource that IOHIDFamily publishes (the original provider; nothing is replaced).
 void evb10_hid_input_start(IOService *resource) {
     unsigned enabled=0,mode=0;
@@ -154,6 +198,17 @@ void evb10_hid_input_start(IOService *resource) {
         const bool touchStarted=touch && touch->metaCast("IOHIDDevice") && touch->init() && touch->attach(resource) && touch->start(resource);
         printf("evb10: hid: separate digitizer %p start %d\n",static_cast<void *>(touch),touchStarted);
         if(!touchStarted && touch){touch->detach(resource);OSSafeReleaseNULL(touch);}
+    }
+    // A USB mouse is a device of its own (Generic Desktop / Mouse), next to the keyboard device, whenever the USB driver
+    // (package/Opi5plusUsb) is linked in -- that is what the weak native_usb_mouse_seq address tests. The kernel pointer
+    // personality is registered first so the mouse interface's event service is the original IOHIDEventDriver, not the
+    // DriverKit dext stand-in that never starts.
+    if(started && &native_usb_mouse_seq) {
+        printf("opi5: hid: kernel pointer personality %d\n",addKernelPointerPersonality());
+        IOService *mouse=native_hid_mouse_allocate();
+        const bool mouseStarted=mouse && mouse->metaCast("IOHIDDevice") && mouse->init() && mouse->attach(resource) && mouse->start(resource);
+        printf("opi5: hid: mouse device %p start %d\n",static_cast<void *>(mouse),mouseStarted);
+        if(!mouseStarted && mouse){mouse->detach(resource);OSSafeReleaseNULL(mouse);}
     }
     // The devices live for the boot: their service attachment and timer stay genuine live objects.
     native_hid_stage=3;

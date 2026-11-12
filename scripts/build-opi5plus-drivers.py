@@ -9,6 +9,7 @@ board.toml. This script builds what the catalog does not carry:
     build/opi5plus-touch/libOpi5plusTouch.a      package/Opi5plusTouch
     build/evb10-hid/                       package/Evb10Hid    (object; build-evb10-hid.py)
     build/native-legacy-display/           package/Evb10Display (object; build-native-legacy-display.py)
+    build/opi5plus-usb/                    package/Opi5plusUsb (object; build-opi5plus-usb.py archives libOpi5plusUsb.a)
 
 An XNU driver has to be compiled with the same flags, the same SDK and the same deployment target as
 the kernel object it lives next to, or the Mach-O it produces will not link or will not run. The kernel
@@ -58,6 +59,11 @@ COMPONENTS = {
     # returns at once. scripts/build-mali-firmware.py has to make package/Mali/mali_csffw.inc from
     # .cache/firmware/mali_csffw.bin first -- without that include this entry does not compile.
     'Mali': (('kits/opi5plus/Mali/Mali.cpp',), 'mali', (), False),
+    # The polled OHCI USB host (package/Opi5plusUsb, the board copy of UniXNU-orangepi5's Opi5Usb): both USB2 host
+    # companions, the boot-protocol HID keyboard / mouse and the native_usb_* mailbox. scripts/build-opi5plus-usb.py
+    # archives it (build/opi5plus-usb/libOpi5plusUsb.a); the late probe calls opi5_usb_start(), which returns at once
+    # without an opi5-usb argument, and opi5plus_display_defconfig force-loads the archive.
+    'Opi5plusUsb': (('kits/opi5plus/Opi5plusUsb/NativeUsb.cpp',), 'opi5plus-usb', (), 'object'),
 }
 
 # The record of a kernel object compiled for the same machine configuration and

@@ -930,6 +930,10 @@ static void opi5_hid_load(void) {
 }
 // package/Mali: the Mali-G610 bring-up (mali=<milestone>); returns at once without that argument.
 extern "C" void mali_start(void);
+// package/Opi5plusUsb: polled OHCI host + boot HID (opi5-usb=<mode>; the board default is 0, so without the argument
+// opi5_usb_start() returns at once after reading the CRU reset status). Weak until opi5plus_display_defconfig
+// force-loads build/opi5plus-usb/libOpi5plusUsb.a: the null check below keeps the kernel link working before that.
+extern "C" void opi5_usb_start(void) __attribute__((weak_import));
 void native_legacy_display_late_probe(void);
 extern void native_keystore_probe(void);
 static void legacy_late_probe_body(void);
@@ -957,6 +961,9 @@ static void legacy_late_probe_body(void) {
     opi5_mark(12, "L2 keystore");
     opi5_hid_load();
     opi5_mark(13, "L3 hid");
+    // The OHCI USB host (package/Opi5plusUsb): starts its thread only when opi5-usb=N is on the command line
+    // (mode 0 default), and is a no-op call at all while the archive is not linked (weak, see above).
+    if (opi5_usb_start) opi5_usb_start();
     mali_start();
     opi5_mark(14, "L4 mali");
     IOService *display=pendingLegacyDisplay;opi5_mark(display?15:55,display?"L5 display pending":"L5 no display");if(!display)return;pendingLegacyDisplay=nullptr;opi5_mark(16, "L6 publishing");

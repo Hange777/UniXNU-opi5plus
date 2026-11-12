@@ -120,6 +120,13 @@ archives = [
   # CPU-copying into the firmware frame buffer. The GOP copy path never completes the original swap protocol
   # (evidence/m5/M5-09), so this is the scanout the display step runs on.
   "build-rk3588-vop-direct.py",
+  # The polled OHCI USB host + boot HID mailbox (package/Opi5plusUsb, UniXNU-orangepi5's Opi5Usb cut for this
+  # board): build-opi5plus-drivers.py Opi5plusUsb compiles NativeUsb.cpp, this script archives it as
+  # build/opi5plus-usb/libOpi5plusUsb.a. It runs only with the opi5-usb=N boot argument (default 0 = the
+  # late-probe call is a no-op) and its mailbox is consumed by package/Opi5plusHid. The same entry sits in the
+  # same slot of UniXNU-orangepi5's board.toml:54; the defconfig that force-loads the archive is
+  # configs/opi5plus_display_defconfig.
+  "build-opi5plus-usb.py",
   # The display archive (M5): the unchanged original IOMobileFramebufferLegacy bound to the GopFramebuffer
   # component's NativeLegacyDisplay, plus the GOP presenter and the key store stand-in. Gated by
   # CONFIG_XNU_NATIVE_LEGACY_DISPLAY=y -- the script exits when it is not set, so the display-less pass does
@@ -351,6 +358,16 @@ kernel_args = [
   # injection first and USB HID next.
   "opi5-hid=1",
   "opi5-hid-input=2",
+  # opi5-usb=<N> (package/Opi5plusUsb, the producer of the native_usb_* HID mailbox that package/Opi5plusHid
+  # now consumes) round-14 staged bring-up, one payload per tier: 3 = enumeration tier (OHCIs started, ports
+  # powered, device/configuration descriptors read, no reports), 5 = poll tier (also boot-configure the
+  # keyboard/mouse and publish reports on the native_usb_* mailbox). Parser: package/Opi5plusUsb/
+  # NativeUsb.cpp:821 (gMode = bootArg("opi5-usb", 0); tier ladder in the comment at :815-817). Hub
+  # semantics: a device behind a hub, or in a USB 3.0 (xHCI) port, is refused at :691 -- "a hub: not
+  # supported" -- so the keyboard/mouse go into the two USB 2.0 Type-A ports directly; EHCI is never started.
+  # opi5-usb-boot-mouse=1 (boot protocol for the mouse, no wheel) joins it if the report-protocol parse of a
+  # real mouse fails on the board.
+  "opi5-usb=5",
   # --- GPU: the Mali-G610 (M7 in plan.md, M4 in the reference port's docs) --------------------------
   # mali=<milestone> is parsed in package/Mali/Mali.cpp:3086: 1 power and GPU_ID, 2 firmware and MCU,
   # 3 command stream, 6/7 several groups, 8 the IOKit service with its user client. The archive is now
