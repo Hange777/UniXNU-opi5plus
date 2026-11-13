@@ -9,17 +9,28 @@ both execve() and posix_spawn(): launchd starts jobs with the latter, which neve
 (measured: an execve-only version never fired, and mobileactivationd still crashed 16 times).
 Off unless the argument names something.
 
+Round 20 adds a trace at the same posix_spawn top: with opi5plus-trace-spawn=1 every spawn prints
+"opi5plus: spawn pid=<caller> path=<target>" and then "opi5plus: spawn pid=<caller> ret=<error>"
+(the entry line carries the return value itself when the spawn is refused). The r14 finding behind
+it: apps opened from the desktop spawned fine but never rendered. The block-exec behaviour is
+unchanged -- bluetoothd is still refused, its own line still prints.
+
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
-@@ -3590,6 +3590,16 @@
+@@ -3590,6 +3590,21 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
  		struct vnode_attr origva;
  	} *__spawn_data;
  
 +#if DEVELOPMENT || DEBUG
++	pid_t opi5plus_spawn_caller = proc_getpid(p);
++	int opi5plus_spawn_traced_entry = 0;
++
 +	{
 +		extern int opi5plus_block_exec_path(user_addr_t);
++		extern void opi5plus_trace_spawn_entry(proc_t, user_addr_t, int, int *);
 +		int opi5plus_blocked = opi5plus_block_exec_path(uap->path);
 +
++		opi5plus_trace_spawn_entry(p, uap->path, opi5plus_blocked, &opi5plus_spawn_traced_entry);
 +		if (opi5plus_blocked != 0) {
 +			return opi5plus_blocked;
 +		}
@@ -28,7 +39,21 @@ Off unless the argument names something.
  	/*
  	 * Allocate a big chunk for locals instead of using stack since these
  	 * structures are pretty big.
-@@ -5127,6 +5137,12 @@
+@@ -4906,6 +4921,13 @@ bad:
+ #endif
+ 
+ 	assert(spawn_no_exec || exec_failure_reason == NULL);
++#if DEVELOPMENT || DEBUG
++	if (opi5plus_spawn_traced_entry) {
++		extern void opi5plus_trace_spawn_ret(pid_t, int);
++
++		opi5plus_trace_spawn_ret(opi5plus_spawn_caller, error);
++	}
++#endif
+ 	return error;
+ }
+ 
+@@ -5127,6 +5149,12 @@ execve(proc_t p, struct execve_args *uap, int32_t *retval)
  #if DEVELOPMENT || DEBUG
  	{
  		extern int opi5plus_trace_exec(proc_t, struct execve_args *);
@@ -41,7 +66,7 @@ Off unless the argument names something.
  		(void)opi5plus_trace_exec(p, uap);
  	}
  #endif
-@@ -10274,4 +10290,46 @@
+@@ -11299,4 +11327,112 @@ opi5plus_report_exits(void)
  		opi5plus_exit_dropped = 0;
  	}
  }
@@ -86,5 +111,71 @@ Off unless the argument names something.
 +	}
 +	printf("opi5plus: exec of %s blocked (opi5plus-block-exec=%s)\n", path, list);
 +	return EPERM;
++}
++
++/*
++ * Orange Pi 5 Plus: trace every posix_spawn at the top where block-exec runs (round 20).
++ *
++ * The r14 dead end: apps opened from the desktop spawned successfully and never rendered, so the
++ * spawn path itself is the next thing on the UART. The entry line names the caller and the target;
++ * the return line pairs with it by pid and carries posix_spawn's own error. The return value is
++ * only knowable at the function's single tail (every error path converges on its bad: label), and
++ * the caller pid is kept from the top because a spawn with POSIX_SPAWN_SETEXEC replaces the caller
++ * before the tail runs. A refused spawn (block-exec) always prints, path and return together; the
++ * ordinary ones stop after a per-boot soft cap of 512 printed spawns and are counted, with one
++ * tally line per 256 suppressed, so a boot whose launchd spawns hundreds does not drown the UART
++ * while the first hundreds stay verbatim.
++ *
++ *	opi5plus-trace-spawn=1	switches the whole thing on; without it nothing prints
++ */
++static int opi5plus_spawn_trace_on = -1;      /* -1 = the boot argument is not parsed yet */
++static unsigned opi5plus_spawn_trace_count = 0, opi5plus_spawn_trace_skipped = 0;
++
++void
++opi5plus_trace_spawn_entry(proc_t caller, user_addr_t path_pointer, int blocked, int *traced)
++{
++	char path[128];
++	size_t length = 0;
++	uint32_t on = 0;
++
++	*traced = 0;
++	if (opi5plus_spawn_trace_on < 0) {
++		opi5plus_spawn_trace_on =
++		    (PE_parse_boot_argn("opi5plus-trace-spawn", &on, sizeof(on)) && on != 0) ? 1 : 0;
++	}
++	if (opi5plus_spawn_trace_on == 0) {
++		return;
++	}
++	if (blocked != 0) {
++		if (copyinstr(path_pointer, path, sizeof(path), &length) != 0 || length == 0) {
++			strlcpy(path, "?", sizeof(path));
++		}
++		printf("opi5plus: spawn pid=%d ret=%d path=%s (block-exec)\n",
++		    proc_getpid(caller), blocked, path);
++		return;
++	}
++	if (opi5plus_spawn_trace_count >= 512) {
++		opi5plus_spawn_trace_skipped = opi5plus_spawn_trace_skipped + 1;
++		if ((opi5plus_spawn_trace_skipped % 256) == 0) {
++			printf("opi5plus: spawn trace capped at 512, %u more suppressed\n",
++			    opi5plus_spawn_trace_skipped);
++		}
++		return;
++	}
++	if (copyinstr(path_pointer, path, sizeof(path), &length) != 0 || length == 0) {
++		strlcpy(path, "?", sizeof(path));
++	}
++	printf("opi5plus: spawn pid=%d path=%s\n", proc_getpid(caller), path);
++	opi5plus_spawn_trace_count = opi5plus_spawn_trace_count + 1;
++	*traced = 1;
++}
++
++void
++opi5plus_trace_spawn_ret(pid_t caller, int error)
++{
++	if (opi5plus_spawn_trace_on != 1) {
++		return;
++	}
++	printf("opi5plus: spawn pid=%d ret=%d\n", caller, error);
 +}
  #endif /* DEVELOPMENT || DEBUG */

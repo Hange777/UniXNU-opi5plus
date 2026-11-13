@@ -38,7 +38,17 @@ problem list (the ~1-per-10-s noise is the block-exec trade's own echo, a user d
 or silence), while the real app-launch defects (CollectionsPoste's SIGKILL loop, the mach_msg2
 wedge, the white blocks) carry forward, plus two new observations: a contextstored/PerfPowerService
 32-thread-watermark flood and named Data-volume permission failures (keybagd/nsurlsessiond)
-([`evidence/round16-result.md`](evidence/round16-result.md)). Earlier
+([`evidence/round16-result.md`](evidence/round16-result.md)). Round 17 (2026-11-13, an unattended
+board test merged with the static and symbolization threads) named the freeze itself: SpringBoard's
+main thread parks at st 0x9 (TH_WAIT|TH_UNINT) inside the CoreUI BOM read of a mmap'd `.car` asset
+(`_UIAssetManager imageNamed:` → `_BOMStreamReadUInt16`) while the icon-decode thread waits on the
+same event — read [high-confidence conjecture] as the page-in of the mapped asset file riding the
+storage path; the apps the user opened spawn successfully and never crash (zero Metal, zero IOMFB,
+no sig 5/6), CollectionsPoste's SIGKILL loop dies inside the wedge waits, and the new posix_spawn
+ledger (723 entries, 211 bluetoothd refusals paired 1:1 with the xpcproxy code-78 corpses a third
+time) plus a 90-tap run that never reached the desktop (the injector's open gate went to the
+kernel-side driver at t+0; backboardd spawned ~9.9 min later) close the round's board record
+([`evidence/round17-result.md`](evidence/round17-result.md)). Earlier
 rounds' two names cited as USB evidence do not hold: `IOHIDSystem` is not a class of this kernel at all (`evidence/m5/M5-08`), and
 the `XHCI: Initialize DWC3` / `XhcDriverBindingStart` lines are the firmware's own `XhciDxe.efi` printing before
 `DARWINBOOT: hand-off`, so they prove the firmware has USB, not that XNU does. At that point the picture still

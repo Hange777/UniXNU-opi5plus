@@ -10,6 +10,10 @@
 //  - 2026-11-13 (S2): the USB HID mailbox consumer of UniXNU-orangepi5's Evb10Hid (pin 729ba25f) is merged in:
 //    the weak native_usb_* externs, mouseDescriptor, usbHidFlush()/mouseFlush() and the mouseOnly device form
 //    (native_hid_mouse_allocate). The injector (opi5-hid-input>=2) and every report it emits are unchanged.
+//  - 2026-11-13 (round 20): after the first completed gesture the injector enters app-launch tapping: it
+//    stops repeating the unlock cycle and taps the App Store icon of the 2560 x 1440 panel once every 30 s
+//    (injectTapTick below), so an app-open wedge reproduces unattended. The gesture itself, the Home channel
+//    and the USB mailbox flush are unchanged.
 #include "OriginalHidDeviceABI.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
@@ -203,6 +207,11 @@ class NativeHidInput : public IOHIDDevice {
     uint32_t injectStep=0,injectGestures=0,injectReports=0,injectFails=0,injectLast=0;
     uint32_t injectNoDriverTicks=0,injectNotOpenTicks=0;
     uint64_t injectFrequency=0,injectStarted=0,injectNextHeartbeat=0;
+    // App-launch tapping (round 20, see injectTapTick): injectTapMode is set when the first gesture
+    // completes -- the unlock gesture is not repeated after that -- and one tap follows every 30 s.
+    // injectTapLiftPending marks the down half of the tap whose lift is still due.
+    bool injectTapMode=false,injectTapLiftPending=false;
+    uint32_t injectTaps=0,injectTapFails=0;
     static unsigned transformCoordinate(int value,int maximum) {
         if(value<0)value=0;if(value>=maximum)value=maximum-1;
         return (unsigned)((long long)value*32767/(maximum-1));
@@ -338,6 +347,12 @@ class NativeHidInput : public IOHIDDevice {
     // long as the boot lasts: backboardd comes up around t+720 s, so a single gesture would land before anything listens.
     // 32767 is full scale on both axes and Y grows downwards, so 80% is near the bottom of the screen and 20% near the top.
     enum {kSamples=21,kSampleMs=20,kPauseMs=5000,kCenterX=16383,kStartY=32767*80/100,kEndY=32767*20/100,kOpenGateSeconds=120};
+    // The tap point (round 20): the App Store icon of the user's photo (2364 x 1773) sits at its centre
+    // (1470, 540) = (0.622, 0.305) of the panel, which on the 2560 x 1440 panel is (1591, 439). The tap
+    // goes through the same report 3 pipe as the gesture (emitTouchReport) and the same panel-to-window
+    // transform (transformPanel), so the constants stay panel pixels; the finger id 2 cannot collide
+    // with the gesture's (1).
+    enum {kTapPanelX=1591,kTapPanelY=439,kTapPanelW=2560,kTapPanelH=1440,kTapPeriodMs=30000,kTapLiftMs=80};
     static uint64_t injectCounter() {uint64_t v;__asm__ volatile("isb\n\tmrs %0, cntpct_el0":"=r"(v));return v;}
     // Sample i of a gesture, i in 0..kSamples-1: the finger walks from 80% to 20% of the screen's height.
     static unsigned injectY(uint32_t step) {return (unsigned)(kStartY+(kEndY-kStartY)*(int)step/(kSamples-1));}
@@ -367,13 +382,46 @@ class NativeHidInput : public IOHIDDevice {
         printf("opi5: hid: inject: gesture %u: lift at %u,%u, reports %u, fails %u, last result %#x\n",
                injectGestures,kCenterX,y,injectReports,injectFails,injectLast);
         injectGestureActive=false;injectStep=0;injectHomePending=false;
-        source->setTimeoutMS(kPauseMs);
+        if(!injectTapMode) {   // the first completed gesture: the unlock is done, the tap cycle takes over
+            injectTapMode=true;
+            printf("opi5: hid: inject: gesture %u complete, entering app-launch tapping: one tap at panel (%u,%u) every %d ms\n",
+                   injectGestures,(unsigned)kTapPanelX,(unsigned)kTapPanelY,(int)kTapPeriodMs);
+        }
+        source->setTimeoutMS(kPauseMs);   // the same 5 s quiet after the lift; the next tick taps instead of re-gesturing
     }
     // The first sample of a gesture, out on the tick that starts it.
     void injectGesture(IOTimerEventSource *source) {
         injectGestures=injectGestures+1;injectGestureActive=true;injectStep=0;
         printf("opi5: hid: inject: gesture %u: down at %u,%u\n",injectGestures,kCenterX,kStartY);
         injectSample(source);
+    }
+    // The tap result counts and logs here, the way injectCount does for the gesture reports.
+    void injectTapCount(IOReturn result) {
+        if(result==kIOReturnSuccess)return;
+        injectTapFails=injectTapFails+1;
+        if(injectTapFails<=5 || injectTapFails%100==0)printf("opi5: hid: inject: tap report failed: %#x\n",(unsigned)result);
+    }
+    // One step of app-launch tapping (round 20): the finger lands on the App Store icon, and 80 ms
+    // later it lifts -- a tap, down and lift in adjacent reports. Runs once per kTapPeriodMs, forever
+    // after the first completed gesture; a wedge during reproduction does not stop it (a tap into a
+    // wedged compositor is as harmless as the gesture was). The same wait-behind-the-driver gate the
+    // gestures have: without an IOHIDEventDriver below, nothing consumes the report.
+    void injectTapTick(IOTimerEventSource *source) {
+        if(!eventDriver(this,4)) {source->setTimeoutMS(1000);return;}
+        const unsigned x=transformPanel(kTapPanelX,kTapPanelW,evb10_fb_w),y=transformPanel(kTapPanelY,kTapPanelH,evb10_fb_h);
+        if(injectTapLiftPending) {
+            injectTapLiftPending=false;
+            injectTaps=injectTaps+1;
+            const IOReturn lift=emitTouchReport(2,2,(unsigned short)x,(unsigned short)y);   // tip up: the lift
+            injectTapCount(lift);
+            printf("opi5: hid: inject: tap %u: down/lift done at %u,%u (panel %u,%u), lift %#x\n",
+                   injectTaps,x,y,(unsigned)kTapPanelX,(unsigned)kTapPanelY,(unsigned)lift);
+            source->setTimeoutMS(kTapPeriodMs);
+            return;
+        }
+        injectTapCount(emitTouchReport(3,2,(unsigned short)x,(unsigned short)y));   // tip + valid: the touch down
+        injectTapLiftPending=true;
+        source->setTimeoutMS(kTapLiftMs);
     }
     // The injector owns the timer while it is armed: it waits for the event driver and for a client (backboardd's
     // IOHIDEventDriver open) and otherwise walks gestures. The t+ heartbeat is counted on the architectural counter, not on
@@ -384,12 +432,13 @@ class NativeHidInput : public IOHIDDevice {
             if(now>=injectNextHeartbeat) {
                 IORegistryEntry *open=eventDriver(this,4);
                 injectNextHeartbeat=injectNextHeartbeat+30*injectFrequency;
-                printf("opi5: hid: inject: t+%u s: gestures %u reports %u fails %u open %d driver %p\n",
+                printf("opi5: hid: inject: t+%u s: gestures %u reports %u fails %u taps %u open %d driver %p\n",
                        (unsigned)((now-injectStarted)/injectFrequency),injectGestures,injectReports,injectFails,
-                       isOpen()?1:0,static_cast<void *>(open));
+                       injectTaps,isOpen()?1:0,static_cast<void *>(open));
             }
         }
         if(injectGestureActive) {injectSample(source);return;}
+        if(injectTapMode) {injectTapTick(source);return;}
         IORegistryEntry *driver=eventDriver(this,4);
         if(!driver) {
             injectNoDriverTicks=injectNoDriverTicks+1;

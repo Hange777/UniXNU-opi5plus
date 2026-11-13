@@ -208,11 +208,19 @@ trust_cache_sha256 = [
 #             the owner-trusted stand-in for /usr/libexec/mobileactivationd is killed for a launch-constraint
 #             violation before it runs (evidence/m7/M7-10).
 #
-# The production command line since round 18 -- 52 arguments, 940 bytes of the 1000-byte limit --
+# The production command line since round 20 -- 52 arguments, 988 bytes of the 1000-byte limit --
 # is complete in this array: tools/wsl/pack-payload.sh passes no --kernel-arg, so this list is the
 # only argument source. The round scripts (tools/wsl/tmp-payload-r10.sh and earlier) still carry
 # their own copies; scripts/unixnu/payload.py:93-96 drops the board entry whose name a --kernel-arg
 # repeats, so both paths produce the same 52 arguments.
+#
+# The round-20 surgery, in the order the 1000-byte budget forced it: out went sd-exec=1 (the
+# execve-only trace is blind to the posix_spawn path the wedge lives on; opi5plus-trace-spawn=1
+# below replaces it and covers both), sd-clock-div=0 and sd-paint=0 (R17 proved both equal their
+# defaults), sd-syscall=1 (the spawn trace plus the sampler cover this round's need for it) and
+# bt5=AppStore (the spawn trace names every spawn path anyway, so the process is still visible --
+# just not sampled). In came opi5plus-trace-spawn=1, opi5-hid-input=2 (the synthetic injector the
+# unlock gesture and the app-launch tap ride on) and bt4=runningboardd / bt6=CollectionsPoste.
 kernel_args = [
   "-v",
   "serial=1",
@@ -242,11 +250,17 @@ kernel_args = [
   # card window at the end of userdata), sd-data-ram (:1549, the payload's Data seed), sd-trace-io
   # (:171, the per-request block trace; no longer passed, see below), sd-clock-div (:1499-1505, 0 leaves
   # the firmware's card-clock divider off). patches/xnu/0002-mount-data-volume.patch: sd-syscall (:100),
-  # sd-paint (:1477), sd-watchdog (:1445), sd-ps (:1576), sd-exit (:1781), sd-exec (:1740, the hook
-  # opi5plus_trace_exec at :1732 -- the per-exec exec line of the round-18 pairing, below).
-  #   sd-syscall=1  DIAGNOSTIC, safe to comment out: the per-syscall trace on the UART. Since round 18
-  #     it also watches xpcproxy and lets its execve ENOENT through the filter (patch :72, :142, :250):
-  #     "sysnum xpcproxy[..] nr 59 errno 2 path ..." is the exit-78 finding.
+  # sd-paint (:1477), sd-watchdog (:1445), sd-ps (:1576), sd-exit (:1781) -- and sd-exec (:1740, the
+  # hook opi5plus_trace_exec at :1732), dropped from this array in round 20: it prints one line per
+  # execve(2), and launchd starts its jobs with posix_spawn(2), which never reaches that hook. The
+  # spawn-side trace of patch 0006 (opi5plus-trace-spawn=1, the diagnostics group below) covers both
+  # entry points.
+  #   sd-syscall=1  DIAGNOSTIC, commented out in round 20 for command-line headroom (the spawn trace
+  #     plus the sampler cover this round's need for it): the per-syscall trace on the UART. Since
+  #     round 18 it also watched xpcproxy and let its execve ENOENT through the filter (patch :72,
+  #     :142, :250): "sysnum xpcproxy[..] nr 59 errno 2 path ..." was the exit-78 finding. Its
+  #     rounds-16..19 traces stand; restoring the line below re-enables it.
+  #   "sd-syscall=1",
   #   sd-watchdog=15  MUST STAY: it arms the RK3588 watchdog (patch 0002:1440-1454) and the heartbeat
   #     thread kicks it every 5 s (patch 0002:1691). That kick is the feed.
   #   sd-ps=300  MUST STAY: patch 0002:1576-1584 terminates the heartbeat thread when both sd-ps and
@@ -255,24 +269,27 @@ kernel_args = [
   #   sd-auto-reboot  deliberately absent: the user asked for the timed self-reboot to go. Patch 0002
   #     :1580-1583 still parses the name if a future round wants it back; a panic reset remains the
   #     last resort while the watchdog covers a hang.
-  #   sd-exec=1  round 18: the per-exec line "opi5plus: exec <pid> <path>" straight to the UART. Paired
-  #     with the exit ring's "opi5plus: exit name[pid] ... code 78" by pid (execve does not change the
-  #     pid, whether it succeeds or fails), it names the program a dying process failed to start.
+  #   sd-exec  removed in round 20, replaced by opi5plus-trace-spawn=1 (patch 0006, the diagnostics
+  #     group below): the round-18 line "opi5plus: exec <pid> <path>" fired on execve(2) only and was
+  #     blind to the posix_spawn(2) path launchd actually uses; the spawn trace prints the caller pid,
+  #     the target path and the return value for both entry points.
   "sd=4",
   "sd-root-trust=1",
   "sd-data-ram=1",
   "sd-data-persist=1",
   "sd-ps=300",
   "sd-exit=1",
-  "sd-exec=1",
-  "sd-syscall=1",
+  # "sd-exec=1",
+  # "sd-syscall=1",
   # sd-trace-io: default 0, verified in round 4 (NativeSd.cpp:170-173 -- uint32_t value = 0, a failed
   # PE_parse_boot_argn leaves it 0), so passing nothing is the same value; commented out for the
   # 1000-byte command-line budget in round 11.
   # "sd-trace-io=0",
-  "sd-clock-div=0",
+  # "sd-clock-div=0",  commented out in round 20 for headroom: R17 proved 0 is the parser's default,
+  #   so the line changed nothing (NativeSd.cpp:1499-1505). Restoring it changes nothing either.
   "sd-watchdog=15",
-  "sd-paint=0",
+  # "sd-paint=0",  commented out in round 20 for headroom: R17 proved 0 is the parser's default
+  #   (patch 0002:1477).
   # --- security: the launch-constraint escape for owner-trusted binaries -----------------------------
   # Parser as in the header. The stand-in payload script (tools/wsl/tmp-payload-stub.sh) also passes this
   # argument; payload.py replaces the board's entry with a --kernel-arg of the same name, so the two paths
@@ -366,14 +383,15 @@ kernel_args = [
   # (with report ID 3). =2 switches that collection on by itself; input on this board is scripted
   # injection first and USB HID next.
   "opi5-hid=1",
-  # Round 18: opi5-hid-input=2 commented out for command-line headroom (17 bytes, with sd-exec=1
-  # taking the room). RISK, recorded for the next on-board acceptance: =2 is what fed the synthetic
-  # report injector (NativeHidInput.cpp:146, :286), and the injector was what moved a lock screen to
-  # the desktop without a hand on the board. Without it a boot that reaches the lock screen needs a
-  # REAL mouse in a USB 2.0 Type-A port (a hub or an xHCI port is refused, NativeUsb.cpp:691) to get
-  # past it; do not plan an unattended acceptance without either this argument back or a mouse
-  # plugged in. Round 3 reached the desktop with =2 (evidence/round3-result.md).
-  # "opi5-hid-input=2",
+  # opi5-hid-input=2  back in round 20: it is what fed the synthetic report injector
+  #   (NativeHidInput.cpp:146, :286), and the injector is what moved a lock screen to the desktop
+  #   without a hand on the board (round 3 reached the desktop with =2, evidence/round3-result.md).
+  #   Round 18 had commented it out for command-line headroom (17 bytes, with sd-exec=1 taking the
+  #   room); round 20 also binds the app-launch tap to it -- after the first completed unlock
+  #   gesture the injector taps the App Store icon every 30 s (NativeHidInput.cpp, injectTapTick).
+  #   Without it a boot that reaches the lock screen needs a REAL mouse in a USB 2.0 Type-A port
+  #   (a hub or an xHCI port is refused, NativeUsb.cpp:691) to get past it.
+  "opi5-hid-input=2",
   # opi5-usb=<N> (package/Opi5plusUsb, the producer of the native_usb_* HID mailbox that package/Opi5plusHid
   # now consumes) round-14 staged bring-up, one payload per tier: 3 = enumeration tier (OHCIs started, ports
   # powered, device/configuration descriptors read, no reports), 5 = poll tier (also boot-configure the
@@ -422,20 +440,37 @@ kernel_args = [
   # set: bt/bt2 keep SpringBoard and backboardd, bt4 keeps chronod (all sampled in rounds 4-11);
   # bt3 moves to WidgetRenderer_D -- the p_comm the "opi5plus: ps" table and the mali sandbox-grant line
   # print for the white rounded-square renderer (full name WidgetRenderer_Default, pid 433 in round 3,
-  # truncated to 16 characters by MAXCOMLEN, which is exactly what the sampler's strncmp(..., 16) compares);
-  # bt5 (contextstored) and bt6 (biomed) are dropped to leave the command line headroom. bt7/bt8 stay
-  # free; comment slots out first when the command line needs more room. Round 18: bt4 (chronod) is
-  # commented out too, again for headroom (21 bytes, with sd-exec=1 taking the room); chronod was
-  # sampled in rounds 4-17, its rounds-12..17 traces stand, and restoring the line below re-enables it.
+  # truncated to 16 characters by MAXCOMLEN, which is exactly what the sampler's strncmp(..., 16) compares).
+  # bt7/bt8 stay free; comment slots out first when the command line needs more room. Round 18 took
+  # bt4 (chronod) out for headroom; round 20 spends the same room on the r14 spawn dead-end: bt4
+  # names runningboardd (13 characters, no truncation -- launchd's bookkeeping daemon, the one whose
+  # posix_spawn calls the new trace prints), bt6 names CollectionsPoste (16 characters, exactly the
+  # sampler's strncmp width -- the truncated form the "opi5plus: ps" table and the r14 logs print for
+  # the posted-notice renderer). bt5 stays out this round: the 22 bytes went to bt6, and the spawn
+  # trace prints App Store's spawn path and return value anyway (patch 0006), so the process stays
+  # visible without being sampled.
   "opi5plus-bt=SpringBoard",
   "opi5plus-bt2=backboardd",
   "opi5plus-bt3=WidgetRenderer_D",
-  # "opi5plus-bt4=chronod",
+  "opi5plus-bt4=runningboardd",
+  # "opi5plus-bt5=AppStore",
+  "opi5plus-bt6=CollectionsPoste",
   "opi5plus-bt-secs=30",
-  # opi5plus-block-exec refuses one execve: patches/xnu/0006-block-exec.patch:74 reads the comma-separated
-  # list and matches the program's basename. bluetoothd is the round-4+ entry (268 exit loops -> 0,
-  # README). DIAGNOSTIC, safe to comment out when bluetoothd's behaviour is wanted again.
+  # opi5plus-block-exec refuses one exec: patches/xnu/0006-block-exec.patch reads the comma-separated
+  # list and matches the program's basename, at the top of both execve(2) and posix_spawn(2).
+  # bluetoothd is the round-4+ entry (268 exit loops -> 0, README). DIAGNOSTIC, safe to comment out
+  # when bluetoothd's behaviour is wanted again.
   "opi5plus-block-exec=bluetoothd",
+  # opi5plus-trace-spawn=1  round 20: every posix_spawn(2) prints one entry line "opi5plus: spawn
+  #   pid=<caller> path=<target>" and one return line "opi5plus: spawn pid=<caller> ret=<error>"
+  #   (patch 0006, the same posix_spawn top where block-exec refuses bluetoothd; the entry line
+  #   carries the return value itself when the spawn is refused). The r14 finding behind it: apps
+  #   opened from the desktop spawned fine but never rendered, so the spawn path itself is the next
+  #   thing to watch. Boot-stage volume: the round-16 boot log shows 96 execve lines and posix_spawn
+  #   runs in the same order of magnitude, so the trace keeps a per-boot soft cap of 512 printed
+  #   spawns -- past it, non-refused spawns are counted and a one-line tally prints every 256
+  #   suppressed spawns. Refused spawns always print. DIAGNOSTIC, safe to comment out.
+  "opi5plus-trace-spawn=1",
   # panic_on_crash_disabled is a base-XNU TUNABLE (the pinned refer xnu-10063.141.1,
   # bsd/kern/kern_exit.c:1695): it stops a crashing task from panicking the kernel, so the exit ring
   # (patch 0002, sd-exit=1 above) can record the death. DIAGNOSTIC, safe to comment out when the
