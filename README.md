@@ -29,7 +29,16 @@ but the screen **still froze** at the first app hover with the swap counter froz
 backlog, so the freeze is a second mechanism (the round-14 wedge thread stands as first suspect),
 and the white blocks were confirmed still on the panel by the user (the 5x5 census grid cannot
 sample the block's region; a region-level sampling is the next instrument)
-([`evidence/round15-result.md`](evidence/round15-result.md)). Earlier
+([`evidence/round15-result.md`](evidence/round15-result.md)). Round 16 (2026-11-13, an unattended
+forensics boot) settled the exit-78 storm round 14 exposed: it pairs 1:1 (strict
+refusal-then-corpse alternation, 0 orphans) with the round-4 bluetoothd block-exec refusals —
+launchd/xpcproxy spawn through posix_spawn(2), which the execve-only hooks never see — so the
+exec-ENOENT reading is falsified and the exit-78 layer is withdrawn from the application-launch
+problem list (the ~1-per-10-s noise is the block-exec trade's own echo, a user decision to accept
+or silence), while the real app-launch defects (CollectionsPoste's SIGKILL loop, the mach_msg2
+wedge, the white blocks) carry forward, plus two new observations: a contextstored/PerfPowerService
+32-thread-watermark flood and named Data-volume permission failures (keybagd/nsurlsessiond)
+([`evidence/round16-result.md`](evidence/round16-result.md)). Earlier
 rounds' two names cited as USB evidence do not hold: `IOHIDSystem` is not a class of this kernel at all (`evidence/m5/M5-08`), and
 the `XHCI: Initialize DWC3` / `XhcDriverBindingStart` lines are the firmware's own `XhciDxe.efi` printing before
 `DARWINBOOT: hand-off`, so they prove the firmware has USB, not that XNU does. At that point the picture still

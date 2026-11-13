@@ -12,7 +12,7 @@ index 0000000..961ba71
 \ No newline at end of file
 
 diff --git a/bsd/dev/arm/systemcalls.c b/bsd/dev/arm/systemcalls.c
-index 8a1ec42..72683eb 100644
+index 8a1ec42..46cec3c 100644
 --- a/bsd/dev/arm/systemcalls.c
 +++ b/bsd/dev/arm/systemcalls.c
 @@ -101,6 +101,12 @@ unix_syscall(
@@ -43,14 +43,15 @@ index 8a1ec42..72683eb 100644
  
  #if CONFIG_MACF
  skip_syscall:
-@@ -582,3 +596,210 @@ arm_clear_syscall_error(struct arm_saved_state * state)
+@@ -582,3 +596,220 @@ arm_clear_syscall_error(struct arm_saved_state * state)
  #else
  #error Unknown architecture.
  #endif
 +
 +#if DEVELOPMENT || DEBUG
 +/*
-+ * Why a boot stops before the UI: the six daemons that walk the Data volume, and only the calls that fail.
++ * Why a boot stops before the UI: the daemons that walk the Data volume, plus the xpcproxy bootstrap
++ * whose execve of them is the one that fails (exit 78), and only the calls that fail.
 + * A path argument is a user pointer, so it is read back with copyinstr() at the point where the errno exists.
 + * Names are matched as prefixes: the kernel cuts p_comm to about fifteen characters.
 + */
@@ -66,6 +67,9 @@ index 8a1ec42..72683eb 100644
 +	"biomesyncd",
 +	"keybagd",
 +	"contextstored",
++	/* Round 18: the XPC bootstrap re-execs the failing program; its execve ENOENT is the
++	 * exit-78 signal, so it joins the watch and its ENOENT is let through below. */
++	"xpcproxy",
 +};
 +#define OPI5PLUS_SYSCALL_NAMES (sizeof(opi5plus_syscall_watch) / sizeof(opi5plus_syscall_watch[0]))
 +
@@ -128,12 +132,14 @@ index 8a1ec42..72683eb 100644
 + * fcntl(2) is the special case: x1 is the command, and F_GETPATH (50) has the file system write the path into
 + * the buffer at x2, so that path only exists once the call has run.
 + * fchmod(124) takes a descriptor and a mode and no path at all, and syscall 50 is setlogin -- realpath(3)
-+ * reaches the kernel through F_GETPATH, not through a call number of its own.
++ * reaches the kernel through F_GETPATH, not through a call number of its own. execve(59) takes the program
++ * path in x0 (arm64 passes the call number in x16/x17 and the arguments in x0-x5), the same slot as open(5).
 + */
 +static int
 +opi5plus_syscall_path_register(int nr, struct arm_saved_state *state)
 +{
 +	switch (nr) {
++	case 59:                /* execve -- the program path the call failed to find is what exit 78 needs */
 +	case 5:                 /* open */
 +	case 136:               /* mkdir */
 +	case 188: case 190:     /* stat, lstat */
@@ -236,8 +242,12 @@ index 8a1ec42..72683eb 100644
 +	 * ENOENT is the normal answer to a daemon probing for a file or a directory it does not need yet, not a
 +	 * failing call: in round 1 it alone took 31 of callservicesd's 40 lines and 33 of contextstored's, and
 +	 * the calls that actually failed never reached the log. The quota and the counters are unchanged.
++	 * The execve exception (round 18) is the exit-78 forensics: a watched process whose execve of the
++	 * program it was asked to start comes back ENOENT dies with exit 78, and that one ENOENT is the
++	 * finding, not noise. The entry hook only fills a slot for a watched process, so getting here with
++	 * slot->nr == 59 already means the name matched the watch list.
 +	 */
-+	if (error == ENOENT) {
++	if (error == ENOENT && slot->nr != 59) {
 +		return;
 +	}
 +	if (opi5plus_syscall_counts[slot->watch] >= OPI5PLUS_SYSCALL_PER_NAME) {

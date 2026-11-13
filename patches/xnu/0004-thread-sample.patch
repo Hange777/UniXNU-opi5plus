@@ -12,7 +12,10 @@ Each thread's line also carries bh, thread->block_hint, and wq, thread->waitq, s
 without symbolising the stack: 2 is a port receive, 6 a semaphore, 0xb a pthread mutex, 0xe a condvar,
 and any other value is printed as it stands. Both are read under the task lock with the rest of the
 line, and they are what separates SpringBoard waiting on a synchronous XPC reply from SpringBoard
-waiting on its own main-thread lock.
+waiting on its own main-thread lock. The heartbeat's user chain ends with " | fps" and the frame
+pointer of every frame it printed, the same pairs the exit line lays out as "lr: ... fp: ...", so a
+chain that has stopped moving is read frame by frame without guessing which return address sits in
+which frame.
 
 The block also serves the exit path. opi5plus_ubt_for_thread(task, thread) prints the same
 frame-pointer chain for a thread of a task that is going away; bsd/kern/kern_exit.c's exit_with_reason()
@@ -33,7 +36,7 @@ is free, and a map that is gone, a start that is not on a 16 KB page or a walk t
 
 --- a/osfmk/kern/bsd_kern.c
 +++ b/osfmk/kern/bsd_kern.c
-@@ -1526,3 +1526,358 @@ bsd_to_mach_failure(int bsd_err)
+@@ -1526,3 +1526,365 @@ bsd_to_mach_failure(int bsd_err)
  		return KERN_FAILURE;
  	}
  }
@@ -208,6 +211,13 @@ is free, and a map that is gone, a start that is not on a 16 KB page or a walk t
 +	    (unsigned long long)get_saved_state_fp(user));
 +	for (i = 0; i < n; i++) {
 +		printf(" %#llx", (unsigned long long)frames[i].lr);
++	}
++	/* Round 18: the frame pointer of each frame after the return addresses, behind a "fps" marker --
++	 * the exit path's lr:/fp: pairs, laid out along one line so a chain that has stopped moving can
++	 * be read frame by frame without guessing which return address sits in which frame. */
++	printf(" | fps");
++	for (i = 0; i < n; i++) {
++		printf(" %#llx", (unsigned long long)frames[i].fp);
 +	}
 +	printf("\n");
 +}

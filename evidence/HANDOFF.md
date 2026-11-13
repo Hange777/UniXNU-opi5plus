@@ -1,4 +1,4 @@
-# Handoff - Orange Pi 5 Plus, UniXNU, 2026-11-13 (after round 15)
+# Handoff - Orange Pi 5 Plus, UniXNU, 2026-11-13 (after round 16)
 
 Read `evidence/sd-clock-investigation.md` (rounds 7-10, the SD line's conclusion), then `evidence/round4-6-result.md`
 (rounds 4-6: block-exec, the SD counters, the serial reset key), then `evidence/round3-result.md` for the input
@@ -104,6 +104,29 @@ Round 15 (2026-11-13) then verified the upstream fence fix `mali-sched-wait=2` o
   (~18 s spacing vs round 13's 12 s), two of them at new own-text crash sites
   (`0x1b6fe4844` / `0x1b68af448`, esr `0x82000007`); silent after t+1680 only because the wedge
   stopped the render side. The exit-78 storm is unchanged (191 lines).
+
+Round 16 (2026-11-13) then settled the exit-78 storm, **and the round-14 reading of it is corrected**
+(unattended forensics run: nobody at the panel, the board left in XNU overnight by the user's
+instruction, kernel `b8113698...`, payload `12badb79...`, command line 940 B / 52 arguments —
+`sd-exec=1` in, census/hid-input/bt4 out for headroom, `evidence/round16-result.md`):
+
+* **The storm is the bluetoothd block-exec retry echo, not an application-spawn failure.** The
+  capture holds 93 `exit xpcproxy[...] code 78` events and 93 `exec of /usr/sbin/bluetoothd
+  blocked` events in a **strict refusal-then-corpse alternation, 0 orphans** (pids 81→373, ~1 per
+  10 s from t+~315, the desktop daemon spawn wave; a later re-attach continues the pairing 3:3).
+  launchd/xpcproxy spawn through **posix_spawn(2), not execve(2)** — patch 0006's comment recorded
+  that long ago — so the new sd-exec execve hook correctly saw only three exec lines (launchd ×2,
+  apfs_boot_util), the new xpcproxy watch and its nr-59 ENOENT exception stayed unexercised, and
+  the exec-ENOENT reading is falsified for the observed data. The refusal (EPERM at the spawn
+  entry) and the EX_CONFIG corpse are one event seen twice.
+* **Consequences:** the exit-78 layer is **removed from the application-launch problem list**
+  (it is the designed self-noise of the round-4 block-exec trade, interaction-independent); the
+  disposal of the ~1-per-10-s noise is a user decision, recorded not changed. The kept new
+  observations: a **thread flood** — `contextstored[56]` and `PerfPowerService[73]` both cross the
+  32-thread high watermark — and named Data-volume permission failures (keybagd `nr 475 errno 17
+  path /var/logs`; nsurlsessiond EEXIST/EPERM on its Library and tmp dirs). Round 14's
+  webbookmarksd lead did not reproduce in this window. Everything else was a clean idle boot:
+  fence 0% held again, no real panic, capture ended naturally at beat t+1240.
 
 ## The infrastructure this session added
 
@@ -214,25 +237,29 @@ Round 15 (2026-11-13) then verified the upstream fence fix `mali-sched-wait=2` o
    `vext/vpur/vinact/vact/vcact/vcmode/lsr` (patch 0002's beat thread, `:1553-1625`, and the counter
    functions in `osfmk/kern/debug.c`, `:1920-1930`) to build the jetsam/compressor baseline, then optionally
    run a `vm_compressor=2` comparison boot.
-5. **Application launch layer - exposed by round 14's real input, the first problem the interaction
-   windows surfaced.** With the mouse working (mode5's full chain), the user's app-launch attempts
-   all opened and instantly quit, then the screen froze; unplugging USB changed nothing. The
-   passive serial probe (`logs/probe-frozen.py`, read-only 15 s) proves the kernel and userland
-   were alive (beats 2720/2725/2730 healthy, launchd spawn/exit continuing) while **the compositor
-   stopped committing frames (swap frozen at 2,596)** and **backboardd/WidgetRenderer_D threads
-   were repeatedly sampled parked at the same two user PCs (0x1daf40b58 / 0x1daf46bdc)**; two
-   suspect clues coexist: a `exit xpcproxy[...] rv 0x4e00 sig 0 code 78` storm (≈ EX_CONFIG; 163
-   lines, pids 81-599) and backboardd's `mali ... refuses a DRM_FORMAT_MOD_LINEAR image for host
-   allocations` (14 lines, msgs 34-62) on the app-texture path. Not a kernel death, not a watchdog
-   scenario; a UI/render-thread wedge plus an app-spawn failure, in the same family as the white
-   blocks (WidgetRenderer threads in the wedge queues). **Next step: symbolise the wedge PCs
-   against the dyld shared cache (`dsc.py --slide`) and attribute the exit-78 storm**
-   (`evidence/round14-result.md` S4). Round 15 splits the freeze further: with `mali-sched-wait=2`
-   the fence gave-up path is verified absent (66/66 fence lines at 0% / 0 gave-up, through the
-   storm peak) and the screen **still** froze at the App-Store hover with the swap counter frozen
-   at 394 — a second wedge mechanism, independent of the fence backlog, with CollectionsPoste's
-   SIGKILL loop running thinner (5 exits, ~18 s spacing, two at new own-text sites
-   `0x1b6fe4844` / `0x1b68af448`) inside the same window (`evidence/round15-result.md` S2-S3).
+5. **Application launch layer - exposed by round 14's real input; round 16 removed its red herring.**
+   With the mouse working (mode5's full chain), the user's app-launch attempts all opened and
+   instantly quit, then the screen froze; unplugging USB changed nothing. The passive serial probe
+   (`logs/probe-frozen.py`, read-only 15 s) proves the kernel and userland were alive (beats
+   2720/2725/2730 healthy, launchd spawn/exit continuing) while **the compositor stopped committing
+   frames (swap frozen at 2,596)** and **backboardd/WidgetRenderer_D threads were repeatedly
+   sampled parked at the same two user PCs (0x1daf40b58 / 0x1daf46bdc)**; backboardd's
+   `mali ... refuses a DRM_FORMAT_MOD_LINEAR image for host allocations` (14 lines, msgs 34-62) sat
+   on the app-texture path as a second clue. **Round 16 falsified the third clue:** the
+   `exit xpcproxy[...] code 78` storm is not an app-spawn failure — it pairs 1:1 (strict
+   refusal-then-corpse alternation, 0 orphans) with the round-4 block-exec gate's bluetoothd
+   refusals, because launchd/xpcproxy spawn through posix_spawn(2) which the execve-only hooks
+   never see; the exit-78 layer is withdrawn from this list, and its ~1-per-10-s noise is a user
+   decision (default: accept and record). What remains here is the real defect set: **a
+   UI/render-thread wedge** (not a kernel death, not a watchdog scenario) plus the same-family
+   white blocks (WidgetRenderer threads in the wedge queues). **Next step: symbolise the wedge PCs
+   against the dyld shared cache (`dsc.py --slide`)** (`evidence/round14-result.md` S4).
+   Round 15 splits the freeze further: with `mali-sched-wait=2` the fence gave-up path is verified
+   absent (66/66 fence lines at 0% / 0 gave-up, through the storm peak) and the screen **still**
+   froze at the App-Store hover with the swap counter frozen at 394 — a second wedge mechanism,
+   independent of the fence backlog, with CollectionsPoste's SIGKILL loop running thinner (5 exits,
+   ~18 s spacing, two at new own-text sites `0x1b6fe4844` / `0x1b68af448`) inside the same window
+   (`evidence/round15-result.md` S2-S3).
 
 ## Key commands
 
@@ -274,7 +301,10 @@ the byte — which is why the reset itself never appears in the capture.
   `sd-auto-reboot=3600` and `offline-legacy-paint=0` and added `opi5plus-block-exec=bluetoothd`); since
   round 11 it is **985 bytes / 53 arguments** (`sd-trace-io=0` dropped for budget — its default is 0 —
   `opi5-gop-mirror=0` added), and since round 15 **990 bytes / 54 arguments** (`mali-sched-wait=2`
-  appended; 10 bytes of headroom left), so adding an argument still means dropping one.
+  appended; 10 bytes of headroom left); since round 16 it is **940 bytes / 52 arguments**
+  (`sd-exec=1` added for the exec hook, `opi5-surface-census=1`, `opi5-hid-input=2` and
+  `opi5plus-bt4=chronod` commented out for headroom — each with a restore line in `board.toml`),
+  so adding an argument still means dropping one.
 * `prepare-xnu-source.py` restores 26 Apple headers over HTTPS and direct TLS is reset on this network; export the
   proxy above or the build stops there.
 * A leftover `startup.o.json` compile record makes the bootstrap pass skip and `archive-03` fail: move it aside

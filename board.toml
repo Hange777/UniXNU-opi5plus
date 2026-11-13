@@ -208,11 +208,11 @@ trust_cache_sha256 = [
 #             the owner-trusted stand-in for /usr/libexec/mobileactivationd is killed for a launch-constraint
 #             violation before it runs (evidence/m7/M7-10).
 #
-# The production command line since round 16 -- 54 arguments, 990 bytes of the 1000-byte limit --
+# The production command line since round 18 -- 52 arguments, 940 bytes of the 1000-byte limit --
 # is complete in this array: tools/wsl/pack-payload.sh passes no --kernel-arg, so this list is the
 # only argument source. The round scripts (tools/wsl/tmp-payload-r10.sh and earlier) still carry
 # their own copies; scripts/unixnu/payload.py:93-96 drops the board entry whose name a --kernel-arg
-# repeats, so both paths produce the same 53 arguments.
+# repeats, so both paths produce the same 52 arguments.
 kernel_args = [
   "-v",
   "serial=1",
@@ -229,7 +229,7 @@ kernel_args = [
   # /private/var tree, the runtime directories (keybags, mobile, mobile/tmp, tmp, run), the container
   # tree and the five preference plists that skip the Setup assistant (opi5plus_seed_tree,
   # opi5plus_seed_prefs_write). The argument is read in opi5plus_userland_prepare() by
-  # PE_parse_boot_argn (patches/xnu/0002-mount-data-volume.patch:1414). sd-data-seed=0 turns the
+  # PE_parse_boot_argn (patches/xnu/0002-mount-data-volume.patch:1428). sd-data-seed=0 turns the
   # seeding off and leaves the volume as the mount left it, which is the way back if the seed itself
   # is what a boot trips over. The MobileGestalt cache wipe that runs next to it is not switched,
   # because it is three unlinks of files that are rewritten on the next query
@@ -241,23 +241,30 @@ kernel_args = [
   # :777-810, bsd_init accepts the SD root without Apple's root hashes), sd-data-persist (:1542, the
   # card window at the end of userdata), sd-data-ram (:1549, the payload's Data seed), sd-trace-io
   # (:171, the per-request block trace; no longer passed, see below), sd-clock-div (:1499-1505, 0 leaves
-  # the firmware's card-clock divider off). patches/xnu/0002-mount-data-volume.patch: sd-syscall (:96),
-  # sd-paint (:1463), sd-watchdog (:1431), sd-ps (:1559), sd-exit (:1721).
-  #   sd-syscall=1  DIAGNOSTIC, safe to comment out: the per-syscall trace on the UART.
-  #   sd-watchdog=15  MUST STAY: it arms the RK3588 watchdog (patch 0002:1429-1440) and the heartbeat
-  #     thread kicks it every 5 s (patch 0002:1631). That kick is the feed.
-  #   sd-ps=300  MUST STAY: patch 0002:1559-1567 terminates the heartbeat thread when both sd-ps and
+  # the firmware's card-clock divider off). patches/xnu/0002-mount-data-volume.patch: sd-syscall (:100),
+  # sd-paint (:1477), sd-watchdog (:1445), sd-ps (:1576), sd-exit (:1781), sd-exec (:1740, the hook
+  # opi5plus_trace_exec at :1732 -- the per-exec exec line of the round-18 pairing, below).
+  #   sd-syscall=1  DIAGNOSTIC, safe to comment out: the per-syscall trace on the UART. Since round 18
+  #     it also watches xpcproxy and lets its execve ENOENT through the filter (patch :72, :142, :250):
+  #     "sysnum xpcproxy[..] nr 59 errno 2 path ..." is the exit-78 finding.
+  #   sd-watchdog=15  MUST STAY: it arms the RK3588 watchdog (patch 0002:1440-1454) and the heartbeat
+  #     thread kicks it every 5 s (patch 0002:1691). That kick is the feed.
+  #   sd-ps=300  MUST STAY: patch 0002:1576-1584 terminates the heartbeat thread when both sd-ps and
   #     sd-auto-reboot are 0; with no beat thread nothing kicks the watchdog and the board resets
   #     every ~89 s (timeout index 15). 300 also prints the process table every 300 s.
   #   sd-auto-reboot  deliberately absent: the user asked for the timed self-reboot to go. Patch 0002
-  #     :1560-1563 still parses the name if a future round wants it back; a panic reset remains the
+  #     :1580-1583 still parses the name if a future round wants it back; a panic reset remains the
   #     last resort while the watchdog covers a hang.
+  #   sd-exec=1  round 18: the per-exec line "opi5plus: exec <pid> <path>" straight to the UART. Paired
+  #     with the exit ring's "opi5plus: exit name[pid] ... code 78" by pid (execve does not change the
+  #     pid, whether it succeeds or fails), it names the program a dying process failed to start.
   "sd=4",
   "sd-root-trust=1",
   "sd-data-ram=1",
   "sd-data-persist=1",
   "sd-ps=300",
   "sd-exit=1",
+  "sd-exec=1",
   "sd-syscall=1",
   # sd-trace-io: default 0, verified in round 4 (NativeSd.cpp:170-173 -- uint32_t value = 0, a failed
   # PE_parse_boot_argn leaves it 0), so passing nothing is the same value; commented out for the
@@ -320,7 +327,9 @@ kernel_args = [
   #   (n, with per-value counts) or mixed. A white block area reading "uniform 0xffffffff" puts the white in
   #   the compositor's layer (content side); anything else points further along the display path. Read-only
   #   diagnostics; with the argument absent the direct path is exactly round 12.
-  "opi5-surface-census=1",
+  #   Round 18: commented out for command-line headroom (the exit-78 forensics needed the 22 bytes for
+  #   sd-exec=1). Its rounds-13..17 verdicts stand; switch it back on by restoring the line below.
+  # "opi5-surface-census=1",
   # --- console mirror: no parser in this repository ---------------------------------------------------
   # vc_mirror is not a base XNU argument: the EVB10 gets it from its own patches/xnu/evb10-vc-mirror.patch
   # (osfmk/console/serial_console.c, pexpert/arm/pe_init.c). Nothing in this repository's patches/xnu/
@@ -357,7 +366,14 @@ kernel_args = [
   # (with report ID 3). =2 switches that collection on by itself; input on this board is scripted
   # injection first and USB HID next.
   "opi5-hid=1",
-  "opi5-hid-input=2",
+  # Round 18: opi5-hid-input=2 commented out for command-line headroom (17 bytes, with sd-exec=1
+  # taking the room). RISK, recorded for the next on-board acceptance: =2 is what fed the synthetic
+  # report injector (NativeHidInput.cpp:146, :286), and the injector was what moved a lock screen to
+  # the desktop without a hand on the board. Without it a boot that reaches the lock screen needs a
+  # REAL mouse in a USB 2.0 Type-A port (a hub or an xHCI port is refused, NativeUsb.cpp:691) to get
+  # past it; do not plan an unattended acceptance without either this argument back or a mouse
+  # plugged in. Round 3 reached the desktop with =2 (evidence/round3-result.md).
+  # "opi5-hid-input=2",
   # opi5-usb=<N> (package/Opi5plusUsb, the producer of the native_usb_* HID mailbox that package/Opi5plusHid
   # now consumes) round-14 staged bring-up, one payload per tier: 3 = enumeration tier (OHCIs started, ports
   # powered, device/configuration descriptors read, no reports), 5 = poll tier (also boot-configure the
@@ -408,11 +424,13 @@ kernel_args = [
   # print for the white rounded-square renderer (full name WidgetRenderer_Default, pid 433 in round 3,
   # truncated to 16 characters by MAXCOMLEN, which is exactly what the sampler's strncmp(..., 16) compares);
   # bt5 (contextstored) and bt6 (biomed) are dropped to leave the command line headroom. bt7/bt8 stay
-  # free; comment slots out first when the command line needs more room.
+  # free; comment slots out first when the command line needs more room. Round 18: bt4 (chronod) is
+  # commented out too, again for headroom (21 bytes, with sd-exec=1 taking the room); chronod was
+  # sampled in rounds 4-17, its rounds-12..17 traces stand, and restoring the line below re-enables it.
   "opi5plus-bt=SpringBoard",
   "opi5plus-bt2=backboardd",
   "opi5plus-bt3=WidgetRenderer_D",
-  "opi5plus-bt4=chronod",
+  # "opi5plus-bt4=chronod",
   "opi5plus-bt-secs=30",
   # opi5plus-block-exec refuses one execve: patches/xnu/0006-block-exec.patch:74 reads the comma-separated
   # list and matches the program's basename. bluetoothd is the round-4+ entry (268 exit loops -> 0,
