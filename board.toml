@@ -457,10 +457,14 @@ kernel_args = [
   "opi5plus-bt6=CollectionsPoste",
   "opi5plus-bt-secs=30",
   # opi5plus-block-exec refuses one exec: patches/xnu/0006-block-exec.patch reads the comma-separated
-  # list and matches the program's basename, at the top of both execve(2) and posix_spawn(2).
-  # bluetoothd is the round-4+ entry (268 exit loops -> 0, README). DIAGNOSTIC, safe to comment out
-  # when bluetoothd's behaviour is wanted again.
-  "opi5plus-block-exec=bluetoothd",
+  # list and matches the program's basename, at the top of both execve(2) and posix_spawn(2). The
+  # bluetoothd entry was removed in round 18: 0002's launchd disabled state
+  # (/private/var/db/com.apple.xpc.launchd/disabled.plist with com.apple.bluetoothd -> true, plus the
+  # disabled.migrated marker, written every boot by opi5plus_launchd_disabled) keeps launchd from
+  # spawning the daemon at all, which is the reason rounds 4-17 needed the refusal (268 exit loops ->
+  # 0, README). The 0006 mechanism stays in the kernel and simply stays inactive without the argument
+  # ("Off unless the argument names something"); a diagnostic can bring it back by adding an entry here.
+  # 31 bytes of the command line went back to the budget (52 -> 51 arguments, 988 -> 957 bytes).
   # opi5plus-trace-spawn=1  round 20: every posix_spawn(2) prints one entry line "opi5plus: spawn
   #   pid=<caller> path=<target>" and one return line "opi5plus: spawn pid=<caller> ret=<error>"
   #   (patch 0006, the same posix_spawn top where block-exec refuses bluetoothd; the entry line

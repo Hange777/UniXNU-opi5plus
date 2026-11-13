@@ -265,7 +265,7 @@ index 8a1ec42..46cec3c 100644
 +}
 +#endif /* DEVELOPMENT || DEBUG */
 diff --git a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
-index 8bba078..b26061a 100644
+index 8bba078..251579c 100644
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -5121,6 +5121,12 @@ proc_exec_switch_task(proc_t old_proc, proc_t new_proc, task_t old_task, task_t
@@ -296,7 +296,7 @@ index 8bba078..b26061a 100644
  
  	/*
  	 * Copy out program name.
-@@ -8055,3 +8069,1630 @@ sysctl_libmalloc_experiments SYSCTL_HANDLER_ARGS
+@@ -8055,3 +8069,1689 @@ sysctl_libmalloc_experiments SYSCTL_HANDLER_ARGS
  }
  
  EXPERIMENT_FACTOR_PROC(_kern, libmalloc_experiments, CTLTYPE_QUAD | CTLFLAG_RW, 0, 0, &sysctl_libmalloc_experiments, "A", "");
@@ -489,6 +489,9 @@ index 8bba078..b26061a 100644
 +		{ "/private/var/db/timezone", 0755, 0, 0 },
 +		{ "/private/var/db/diagnostics", 0755, 0, 0 },
 +		{ "/private/var/db/uuidtext", 0755, 0, 0 },
++		/* launchd reads /private/var/db/com.apple.xpc.launchd/disabled.plist and keeps its migration
++		 * state in disabled.migrated next to it; opi5plus_launchd_disabled() writes both below. */
++		{ "/private/var/db/com.apple.xpc.launchd", 0755, 0, 0 },
 +		{ "/private/var/mobile", 0755, 501, 501 },
 +		{ "/private/var/mobile/tmp", 0755, 501, 501 },
 +		{ "/private/var/mobile/Library", 0755, 501, 501 },
@@ -682,12 +685,13 @@ index 8bba078..b26061a 100644
 +	return error;
 +}
 +
-+/* A file of exactly these bytes (O_TRUNC), with this owner and mode, and on the medium before it returns. */
++/* A file of exactly these bytes (O_TRUNC), with this owner and mode, and on the medium before it returns.
++ * The context is a plain argument, so the writers outside the seed walk (the launchd disabled state below)
++ * can use the same path with vfs_context_kernel(). */
 +static int
-+opi5plus_seed_write(struct opi5plus_seed *seed, const char *path, const void *data, size_t size, mode_t mode,
++opi5plus_seed_write(vfs_context_t ctx, const char *path, const void *data, size_t size, mode_t mode,
 +    uid_t uid, gid_t gid)
 +{
-+	vfs_context_t ctx = seed->ctx;
 +	vnode_t vp = NULLVP;
 +	off_t done = 0;
 +	int error = vnode_open(path, O_CREAT | O_TRUNC | FWRITE | O_NOFOLLOW, mode, 0, &vp, ctx);
@@ -1041,7 +1045,7 @@ index 8bba078..b26061a 100644
 +		int error;
 +
 +		snprintf(path, MAXPATHLEN, "/private/var/mobile/Library/Preferences/%s.plist", opi5plus_seed_prefs[i].name);
-+		error = opi5plus_seed_write(seed, path, opi5plus_seed_prefs[i].body, strlen(opi5plus_seed_prefs[i].body), 0600,
++		error = opi5plus_seed_write(seed->ctx, path, opi5plus_seed_prefs[i].body, strlen(opi5plus_seed_prefs[i].body), 0600,
 +		    501, 501);
 +		if (error != 0) {
 +			opi5plus_seed_fail(seed, path, "writing", error);
@@ -1050,6 +1054,57 @@ index 8bba078..b26061a 100644
 +	kfree_data(path, MAXPATHLEN);
 +	printf("opi5plus: seed: wrote %d preference files (Setup skipped, auto dim and idle sleep off)\n",
 +	    (int)(sizeof(opi5plus_seed_prefs) / sizeof(opi5plus_seed_prefs[0])));
++}
++
++/*
++ * Orange Pi 5 Plus: launchd's disabled-services state, written every boot.
++ *
++ * The Data volume is persistent here (sd-data-persist=1), so the first-boot seed is skipped from the
++ * second boot on by the /private/var/.opi5plus-seeded marker -- anything the seed alone wrote would be
++ * first-boot-only by construction. These two files go through the every-boot path instead, right after
++ * the ensure_dirs skeleton above: disabled.migrated (the empty marker that tells launchd its migration
++ * pass is done) and disabled.plist, the label->true map that keeps launchd from spawning
++ * com.apple.bluetoothd on its own. Rounds 4-17 refused the exec instead (opi5plus-block-exec=bluetoothd,
++ * 0006) because the daemon dies in its own main() and launchd kept restarting it; the plist removes the
++ * reason, and the argument leaves board.toml with it. launchd reads both paths under
++ * /private/var/db/com.apple.xpc.launchd, which the ensure_dirs table now creates (0755, root). Both files
++ * root:0644; sd-data-launchd=0 turns the write off.
++ */
++static void
++opi5plus_launchd_disabled(void)
++{
++	static const char plist[] =
++	    OPI5PLUS_PL_HEAD OPI5PLUS_PL_TRUE("com.apple.bluetoothd") OPI5PLUS_PL_TAIL;
++	static const struct {
++		const char *name;
++		const char *data;
++		size_t size;
++	} files[] = {
++		{"disabled.migrated", "", 0},
++		{"disabled.plist", plist, sizeof(plist) - 1},
++	};
++	uint32_t disable = 1;
++	vfs_context_t ctx = vfs_context_kernel();
++	char *path;
++
++	(void) PE_parse_boot_argn("sd-data-launchd", &disable, sizeof(disable));
++	if (disable == 0) {
++		printf("opi5plus: launchd: sd-data-launchd=0, the disabled state is left as it is\n");
++		return;
++	}
++	path = kalloc_data(MAXPATHLEN, Z_WAITOK);
++	if (path == NULL) {
++		printf("opi5plus: launchd: out of memory for the disabled state paths\n");
++		return;
++	}
++	for (unsigned i = 0; i < sizeof(files) / sizeof(files[0]); ++i) {
++		int error;
++
++		snprintf(path, MAXPATHLEN, "/private/var/db/com.apple.xpc.launchd/%s", files[i].name);
++		error = opi5plus_seed_write(ctx, path, files[i].data, files[i].size, 0644, 0, 0);
++		printf("opi5plus: launchd: %s -> %d\n", path, error);
++	}
++	kfree_data(path, MAXPATHLEN);
 +}
 +
 +/* Written on a persistent Data volume after the first complete copy; present = the tree is there. */
@@ -1172,7 +1227,7 @@ index 8bba078..b26061a 100644
 +		/* Everything above is on the card before the marker says so. */
 +		error = VFS_SYNC(data_mount, MNT_WAIT, seed.ctx);
 +		if (error == 0) {
-+			error = opi5plus_seed_write(&seed, OPI5PLUS_SEED_MARKER, marker_text, sizeof(marker_text) - 1,
++			error = opi5plus_seed_write(seed.ctx, OPI5PLUS_SEED_MARKER, marker_text, sizeof(marker_text) - 1,
 +			    0644, 0, 0);
 +		}
 +		if (error == 0) {
@@ -1416,6 +1471,10 @@ index 8bba078..b26061a 100644
 +			opi5plus_ensure_dirs(p, scratch);
 +		}
 +	}
++	/* Every boot, before launchd runs: its disabled-services state (opi5plus_launchd_disabled). The
++	 * first-boot seed cannot carry it -- a persistent Data volume is marker-skipped from the second
++	 * boot on. */
++	opi5plus_launchd_disabled();
 +	/* Every boot, before launchd runs: the MobileGestalt caches go (opi5plus_wipe_mobilegestalt). */
 +	opi5plus_wipe_mobilegestalt(p, scratch);
 +	{

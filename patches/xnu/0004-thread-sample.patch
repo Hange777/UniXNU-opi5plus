@@ -17,6 +17,17 @@ pointer of every frame it printed, the same pairs the exit line lays out as "lr:
 chain that has stopped moving is read frame by frame without guessing which return address sits in
 which frame.
 
+Round 21 adds the kernel-mutex half of the answer: a thread whose bh is 1 (kThreadWaitKernelMutex) is
+a lck_mtx waiter, and lck_mtx_lock_wait() asserts it on the mutex's own state word, so thread->wait_event
+is the address of the word that holds the owner and the lck_mtx_t sits 8 bytes below it. For such a
+thread the sample appends " | mtx <addr> state <word> owner <proc> tid <tid> st <st> bh <bh> ev <ev>
+upc <pc> ulr <lr>" -- the holder's own thread_id, its bsd proc name, its state, block hint and wait
+event, and the user pc/lr of its last trap. The read is strict: the owner word is only read, never
+written, no lock is taken and nothing is woken; a cleared or stale word prints "owner ?" and a zero
+event prints "mtx ?". Round 17 froze with the SpringBoard main thread and its icon decoder both at
+bh=1 on the same mutex, and this names the mutex (to be matched against the NativeSd lock inventory
+line "opi5plus: sd: lock <name> iolock=<p> mtx=<p>") and the thread that holds it.
+
 The block also serves the exit path. opi5plus_ubt_for_thread(task, thread) prints the same
 frame-pointer chain for a thread of a task that is going away; bsd/kern/kern_exit.c's exit_with_reason()
 declares it extern and calls it for a signal death, and every character goes out through PE_kputc
@@ -36,7 +47,7 @@ is free, and a map that is gone, a start that is not on a 16 KB page or a walk t
 
 --- a/osfmk/kern/bsd_kern.c
 +++ b/osfmk/kern/bsd_kern.c
-@@ -1526,3 +1526,365 @@ bsd_to_mach_failure(int bsd_err)
+@@ -1526,3 +1526,441 @@ bsd_to_mach_failure(int bsd_err)
  		return KERN_FAILURE;
  	}
  }
@@ -69,6 +80,9 @@ is free, and a map that is gone, a start that is not on a 16 KB page or a walk t
 +
 +extern char *proc_name_address(void *p);
 +extern struct arm_saved_state *get_user_regs(thread_t thread);
++/* kern/thread.h, XNU_KERNEL_PRIVATE: the compact thread id a mutex's owner word holds, resolved to the
++ * thread that owns it (a plain table read, no lock). */
++extern thread_t ctid_get_thread_unsafe(ctid_t ctid);
 +
 +static int opi5plus_bt_state;   /* 0 not read yet, 1 no names, 2 at least one name */
 +static char opi5plus_bt_names[OPI5PLUS_BT_NAMES][17];    /* 16 characters and the terminator */
@@ -349,6 +363,74 @@ is free, and a map that is gone, a start that is not on a 16 KB page or a walk t
 +	opi5plus_ubt_puts("\r\n");
 +}
 +
++/*
++ * Orange Pi 5 Plus: who holds the kernel mutex a bh==1 thread is queued behind.
++ *
++ * kThreadWaitKernelMutex (osfmk/kern/block_hint.h:34) is set in exactly one place on arm64,
++ * lck_mtx_lock_wait() (osfmk/kern/lock_mtx.c:568), and that call asserts the waiter on the mutex's own
++ * state word: LCK_MTX_EVENT(lck) is CAST_EVENT64_T(&lck->lck_mtx.data) (lock_mtx.c:105) and
++ * waitq_assert_wait64() stores it in thread->wait_event (osfmk/kern/waitq.c:569). A bh==1 thread's
++ * wait_event is therefore the address of the very word whose low 28 bits name the owner
++ * (LCK_MTX_CTID_MASK, kern/lock_mtx.h:52), and the lck_mtx_t itself sits 8 bytes below it. Reading the
++ * word and resolving its compact owner id through ctid_get_thread_unsafe() (kern/thread.c:4109) names
++ * the holder thread.
++ *
++ * Strictly read-only: no lock is taken, no lock word is written, nothing is woken. A stale or cleared
++ * word (the holder released the lock between the sample and this read) prints "owner ?" instead of
++ * guessing, and an event of zero prints "mtx ?" -- the same non-fatal style the rest of the block uses.
++ * The appended segment goes on the waiter's existing line, ahead of its user state, so one line names
++ * the waiter, the mutex, and the thread (and its last user pc/lr) that holds the mutex.
++ */
++static void
++opi5plus_mtx_owner(thread_t thread)
++{
++	const uint64_t event = (unsigned long long)thread->wait_event;
++	uint32_t word;
++	uint32_t owner;
++	thread_t held;
++	task_t owner_task;
++	struct arm_saved_state *regs;
++	void *bsd;
++	const char *name;
++
++	if (event == 0) {
++		printf(" | mtx ?");
++		return;
++	}
++	word = *(volatile uint32_t *)(uintptr_t)event;
++	owner = word & 0x0fffffffu;    /* LCK_MTX_CTID_MASK, kern/lock_mtx.h */
++	printf(" | mtx %#llx state %#x", event - 8, word);
++	if (owner == 0) {
++		printf(" owner ?");
++		return;
++	}
++	held = ctid_get_thread_unsafe(owner);
++	if (held == THREAD_NULL) {
++		printf(" owner ?");
++		return;
++	}
++	/* The owner's task comes from get_threadtask(): on arm64 the task pointer lives in the thread_ro
++	 * half of the thread (kern/thread.h: struct task *t_task exists only on x86_64/__arm__), and this
++	 * accessor is the read-only way to it. */
++	owner_task = get_threadtask(held);
++	name = NULL;
++	bsd = owner_task != TASK_NULL ? get_bsdtask_info(owner_task) : NULL;
++	if (bsd != NULL) {
++		name = proc_name_address(bsd);
++	}
++	printf(" owner %s tid %#llx st %#x bh %#x ev %#llx", name != NULL && name[0] != 0 ? name : "-",
++	    (unsigned long long)held->thread_id, (unsigned)held->state, (unsigned)held->block_hint,
++	    (unsigned long long)held->wait_event);
++	regs = get_user_regs(held);
++	if (regs != NULL) {
++		printf(" upc %#llx ulr %#llx",
++		    (unsigned long long)get_saved_state_pc(regs),
++		    (unsigned long long)get_saved_state_lr(regs));
++	} else {
++		printf(" upc - ulr -");
++	}
++}
++
 +void
 +opi5plus_task_sample(task_t task, uint64_t seconds)
 +{
@@ -387,6 +469,11 @@ is free, and a map that is gone, a start that is not on a 16 KB page or a walk t
 +		    (int)thread->wait_result, (unsigned long long)thread->wait_event,
 +		    (unsigned long long)(uintptr_t)thread->continuation,
 +		    (unsigned)thread->block_hint, (void *)thread->waitq.wq_q);
++		/* Round 21: a bh==1 thread is a kernel-mutex waiter; name the mutex and its holder (read-only
++		 * reverse lookup, opi5plus_mtx_owner above). */
++		if (thread->block_hint == 1u) {    /* kThreadWaitKernelMutex, kern/block_hint.h */
++			opi5plus_mtx_owner(thread);
++		}
 +		if (user == NULL) {
 +			printf(" | no user state\n");
 +			continue;

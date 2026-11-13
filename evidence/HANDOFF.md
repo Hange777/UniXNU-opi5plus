@@ -1,4 +1,4 @@
-# Handoff - Orange Pi 5 Plus, UniXNU, 2026-11-13 (after round 17)
+# Handoff - Orange Pi 5 Plus, UniXNU, 2026-11-13 (after round 18)
 
 Read `evidence/sd-clock-investigation.md` (rounds 7-10, the SD line's conclusion), then `evidence/round4-6-result.md`
 (rounds 4-6: block-exec, the SD counters, the serial reset key), then `evidence/round3-result.md` for the input
@@ -160,6 +160,29 @@ arguments — the spawn trace in, `sd-exec`/`sd-syscall`/`sd-clock-div`/`sd-pain
   seed dir + `disabled.migrated` + `disabled.plist`, then `block-exec` −31 B) — awaiting the
   user's decision.
 
+Round 18 (2026-11-13, unattended board test; kernel `f9e14341...`, payload `3940e422...`,
+command line 957 B / 51 arguments — **`block-exec` left the command line**, `evidence/round18-result.md`)
+settled the wedge's mechanism and retired the bluetoothd noise at its source:
+
+* **The wedge is demand-paging bandwidth starvation on the SD window lock [confirmed, upgraded
+  from round 17's page-in conjecture].** The new bh==1 reverse lookup (patch 0004) plus the
+  NativeSd lock inventory read all 25 bh==1 samples of the capture: 23 queue on the **SystemOS**
+  window lock (OS and Data: zero), which rotates through **19 distinct user-mode holders** with
+  none stuck — queue saturation, not a deadlock — and SpringBoard's main thread sits in that
+  queue seven times across the frozen window. Through the freeze the read path ran at its exact
+  ceiling (89.4 req/s, 5.61 MiB/s, failures 0; terminal values within ~0.1% of round 17) — the
+  ~11.5 MB/s PIO path is saturated by SystemOS cryptex demand paging. **The fix lever is the
+  standing CRU clock-tree change (2× ≈ 23 MB/s), evaluation pending**; a cryptex warm-up /
+  prefetch is the alternate.
+* **disabled.plist implemented and it won completely:** both files written every boot (error 0),
+  bluetoothd 0 spawns / 0 refusals, the exit-78 storm collapsed 211 → 1 (the single corpse has no
+  named launchd line in this capture — the WebBookmarks attribution stays unconfirmed).
+* **The deferred unlock behaved as coded and exposed its own tension:** the 600-s fallback
+  fired at t+600 on "backboardd 1 swap 0" and gestured against an undrawn lock screen; 70 taps,
+  fails 0, zero AppStore spawns. And the tap question gained a new layer: the display registry
+  printed **`IOHIDSystem absent` on all 90 registry lines** — the synthetic events had no
+  consumer (item 6 below).
+
 ## The infrastructure this session added
 
 * **Round-end automation: the board resets itself back to Linux.** `py -3 tools/wsl/serial-reset.py` sends 0x1d
@@ -269,44 +292,43 @@ arguments — the spawn trace in, `sd-exec`/`sd-syscall`/`sd-clock-div`/`sd-pain
    `vext/vpur/vinact/vact/vcact/vcmode/lsr` (patch 0002's beat thread, `:1553-1625`, and the counter
    functions in `osfmk/kern/debug.c`, `:1920-1930`) to build the jetsam/compressor baseline, then optionally
    run a `vm_compressor=2` comparison boot.
-5. **Application launch layer - round 17 names the root cause: an uninterruptible CoreUI asset
-   page-in [high-confidence conjecture].** The history, compressed: round 14 exposed the defect
-   with real input (apps opened and "instantly quit", then the screen froze); round 15 split the
-   freeze from the fence layer (`mali-sched-wait=2` verified the fence gave-up path absent, the
-   screen still froze); round 16 withdrew the exit-78 red herring (the storm pairs 1:1 with the
-   bluetoothd block-exec refusals — posix_spawn never reaches the execve-only hooks — and is
-   interaction-independent noise, a user decision to accept); round 17 then read the freeze frame
-   by frame. What is now established:
-   * **The app processes themselves do not crash.** R19 (`.cache/r19-fate/REPORT.md`): the apps
-     the user opened in round 14 — AppStore[540], Preferences[530], MobileSlideShow[544] —
-     spawned successfully, stayed alive in the ps snapshots with **zero Metal initialisation and
-     zero IOMFB clients, and never exited**; no app died with sig 5/6 anywhere; round 15's taps
-     produced no app process at all. The "white flash then gone" is the composition layer, not
-     the app.
-   * **CollectionsPoste's SIGKILL loop belongs to the wedge layer, not a fourth defect**: the
-     dying extension threads stop at the same mach_msg2/ulock_wait PCs as the wedged threads
-     (R19, now symbolised: `___ulock_wait+0x8` / `__dlock_wait+0x34`).
-   * **The freeze's named chain (round 17, `evidence/round17-result.md` S3-S4):** SpringBoard's
-     main thread, at st 0x9 = TH_WAIT|TH_UNINT, stops inside the CoreUI BOM read of a mmap'd
-     `.car` asset (`_UIAssetManager imageNamed:` → `CUICatalog namedVectorGlyph` →
-     `CUIStructuredThemeStore` → `_BOMTreeGetValueSize` → `_BOMStreamReadUInt16`), while
-     SpringBoard's icon-decode thread waits on the **same event word** — two independent paths,
-     one uninterruptible event — with backboardd and runningboardd every thread healthy. The
-     reading [conjecture → high-confidence]: the page-in of the mapped asset file, riding this
-     port's storage path; r14's storm, r15's icon hover and r17's post-tap freeze all align on
-     it. The r15 "wild jump" PCs are real call edges (MediaToolbox
-     `FigPictureTileCursorServiceGetClassID+0`, VideoToolbox
-     `VTTileDecompressionSessionCreate+0`) read as on-demand paging misses plus the kill-moment
-     artifact, and r14's backboardd "wedge" thread corrects to a QuartzCore IOMFBServer runloop
-     idling normally.
-   * **Next step: capture the kernel-side stack at the uninterruptible wait** (the sampler's
-     `ev` channel, a small 0004/0002 addition) — it names the page-in site and the backing file
-     directly. Second, on the user's decision: the **disabled.plist** route R20 evaluated as
-     conditionally feasible (label `com.apple.bluetoothd`, our pinned launchd, minimal seed
-     addition, `block-exec` −31 B). Third: fix the injector's gesture timing (hang the unlock
-     gesture after backboardd by name — round 17's 90 taps all fell on the lock screen because
-     the open gate went to the kernel-side IOHIDEventDriver at t+0 while backboardd spawned
-     ~9.9 min later).
+5. **The UI wedge - round 18 confirms the root cause: SystemOS demand-paging bandwidth
+   starvation on the SD window lock.** The history, compressed: round 14 exposed the defect with
+   real input; round 15 split the freeze from the fence layer; round 16 withdrew the exit-78 red
+   herring (bluetoothd noise); round 17 read the freeze frame by frame (SpringBoard's main thread
+   uninterruptible inside the CoreUI BOM read of a mmap'd `.car` asset, the icon-decode thread on
+   the same event, backboardd/runningboardd healthy); round 18 named the lock. Established now:
+   * **The mechanism [confirmed]:** the round-18 bh==1 reverse lookup (patch 0004) plus the
+     NativeSd lock inventory read all 25 bh==1 samples of the boot: 23 queue on the **SystemOS**
+     window lock (OS and Data: zero), which rotates through **19 distinct user-mode holders**
+     with none stuck — queue saturation, not a deadlock — with two nested waits caught in the
+     act (mediaremoted t+660, mediaserverd t+1800: holding SystemOS while uninterruptibly
+     waiting on the gate), and SpringBoard's main thread in the queue seven times across the
+     frozen window. Through the freeze (swap static t+1810-2700) the read path ran at its exact
+     ceiling — 89.4 req/s, 5.61 MiB/s, failures 0, terminal values within ~0.1% of round 17 —
+     the ~11.5 MB/s PIO path saturated by SystemOS cryptex (~3.3 GB) demand paging.
+   * **The fix lever: the standing CRU clock-tree change** (move the sdmmc source clock to
+     52 MHz, 2× ≈ 23 MB/s, `evidence/sd-clock-investigation.md`) — evaluation pending, the
+     first candidate that attacks the named mechanism. Alternate: a cryptex working-set
+     warm-up / prefetch.
+   * **Carried facts that shaped this item:** the app processes themselves never crash (R19:
+     AppStore/Preferences/MobileSlideShow spawned successfully, zero Metal, zero IOMFB, never
+     exited; no sig 5/6 anywhere); CollectionsPoste's SIGKILL loop dies inside the wedge waits;
+     the r15 "wild jump" PCs are real call edges read as paging misses plus kill-moment
+     artifacts; r14's backboardd "wedge" thread corrects to an idling IOMFBServer runloop.
+   * **Already done inside this item:** `disabled.plist` implemented (0002, every boot) and
+     bluetoothd retired at the source — the exit-78 storm collapsed 211 → 1 and `block-exec`
+     left the command line.
+6. **`IOHIDSystem absent` - the synthetic-input dead end, new as of round 18.** The display
+   registry printed `IOHIDSystem absent` on all 90 registry lines of the round-18 boot
+   (t+30 → t+2700), so the injector's synthetic touch events had no consumer: backboardd is
+   alive, accepted three synthetic swaps, and the taps (70, fails 0) never produced an
+   AppStore spawn. `IOHIDSystem` is not a class of this kernel (`evidence/m5/M5-08`), but the
+   question is now concrete: **which object in backboardd consumes synthetic digitizer events
+   on real iPadOS, and why does that path not exist here?** Next: name the consumer
+   (source read of backboardd's event routing, or a registry probe on the board), then either
+   publish it or re-route the injector. Related instrument fix: the gesture fallback should
+   also require a swap (round 18's 600-s fallback gestured against an undrawn lock screen).
 
 ## Key commands
 
@@ -353,8 +375,9 @@ the byte — which is why the reset itself never appears in the capture.
   `opi5plus-bt4=chronod` commented out for headroom — each with a restore line in `board.toml`);
   since round 17 it is **988 bytes / 52 arguments** (`opi5plus-trace-spawn=1` and the injector's
   `opi5-hid-input=2` back plus `bt4=runningboardd`/`bt6=CollectionsPoste` in; `sd-exec=1`,
-  `sd-syscall=1`, `sd-clock-div=0`, `sd-paint=0` out), so adding an argument still means dropping
-  one.
+  `sd-syscall=1`, `sd-clock-div=0`, `sd-paint=0` out), and since round 18 **957 bytes / 51
+  arguments** (`opi5plus-block-exec=bluetoothd` removed — disabled.plist made it unnecessary —
+  31 bytes back), so adding an argument still means dropping one.
 * `prepare-xnu-source.py` restores 26 Apple headers over HTTPS and direct TLS is reset on this network; export the
   proxy above or the build stops there.
 * A leftover `startup.o.json` compile record makes the bootstrap pass skip and `archive-03` fail: move it aside

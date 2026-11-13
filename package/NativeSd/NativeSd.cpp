@@ -528,6 +528,13 @@ bool NativeSdBlock::configure(NativeSd *controller, const char *name, uint64_t f
 	__builtin_strncpy(label, name, sizeof(label) - 1);
 	bounce = static_cast<uint8_t *>(IOMallocData(kChunkBytes));
 	lock = IOLockAlloc();
+	// Round 21, once per window: the same inventory as the gate line above, under the window's own name.
+	// The card read path holds this lock for the whole request (doAsyncReadWrite) while readBlocks below
+	// waits on the controller's gate, so both are candidates for a bh==1 waiter's mutex; the sampler
+	// matches the printed mtx against what its reverse lookup found.
+	if (lock) {
+		IOLog("opi5plus: sd: lock %s iolock=%p mtx=%p\n", label, lock, IOLockGetMachLock(lock));
+	}
 	return bounce && lock;
 }
 
@@ -539,6 +546,9 @@ bool NativeSdBlock::configureRam(const char *name, uint8_t *memory, uint64_t byt
 	ram = memory;
 	ramBytes = bytes;
 	__builtin_strncpy(label, name, sizeof(label) - 1);
+	// Round 21, the inventory's completion: a RAM window answers straight out of memory (doAsyncReadWrite's
+	// ram branch) and has no lock of its own -- say so, so an absent line cannot be mistaken for a missed one.
+	IOLog("opi5plus: sd: lock %s iolock=- mtx=- (ram window, no lock)\n", label);
 	return true;
 }
 
@@ -1478,6 +1488,11 @@ bool NativeSd::start(IOService *provider) {
 	host.attach(&kPlatform, registers);
 	gate = IOLockAlloc();
 	if (!gate) return false;
+	// Round 21, printed once: the inventory the thread sampler needs. IOLock is lck_mtx_t in this kernel
+	// (iokit/IOKit/IOLocks.h, IOLOCKS_INLINE; IOLockAlloc is lck_mtx_alloc_init), so the two addresses are
+	// the same kernel word -- and the sampler names a bh==1 waiter's mutex as wait_event-8
+	// (patches/xnu/0004-thread-sample.patch), which is exactly this pointer.
+	IOLog("opi5plus: sd: lock gate iolock=%p mtx=%p\n", gate, IOLockGetMachLock(gate));
 
 	host.dump("firmware state");
 	// sd-reset=1 asks for the controller to be reset before probing. It is off by default, and that default

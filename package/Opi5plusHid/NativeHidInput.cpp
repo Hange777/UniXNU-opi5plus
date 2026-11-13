@@ -14,6 +14,13 @@
 //    stops repeating the unlock cycle and taps the App Store icon of the 2560 x 1440 panel once every 30 s
 //    (injectTapTick below), so an app-open wedge reproduces unattended. The gesture itself, the Home channel
 //    and the USB mailbox flush are unchanged.
+//  - 2026-11-13 (round 21): the unlock gesture's trigger moves off the open gate. The kernel's own
+//    IOHIDEventDriver opens this device at t+0, so the old gate released at t+3 and the gesture landed
+//    before anything listened. The trigger now: backboardd has spawned (patch 0006's spawn tracker sets
+//    native_spawn_seen_backboardd at the posix_spawn top) AND the display has completed at least one swap
+//    (LegacyDisplayProbe's native_legacy_swap_accepted_count, the parity line's "swap ok"), then 30 s of
+//    quiet before the first gesture; 10 minutes without both falls back to the old driver/open gate. The
+//    open gate itself stays, bounded as before, as the second filter.
 #include "OriginalHidDeviceABI.h"
 #include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOWorkLoop.h>
@@ -46,6 +53,14 @@ extern volatile uint8_t native_usb_mouse[4] __attribute__((weak_import));
 extern volatile int32_t native_usb_mouse_dx __attribute__((weak_import));
 extern volatile int32_t native_usb_mouse_dy __attribute__((weak_import));
 extern volatile int32_t native_usb_mouse_wheel __attribute__((weak_import));
+// Round 21 unlock gate, the two conditions of the deferred gesture (weak for the same reason the USB
+// mailbox is: both producers sit behind hand-maintained code paths and the driver must stay linkable
+// without them). native_spawn_seen_backboardd is set at patch 0006's posix_spawn top the moment the
+// target's basename is backboardd -- the trace switch opi5plus-trace-spawn only gates the printing,
+// not this flag. native_legacy_swap_accepted_count is LegacyDisplayProbe's own swap counter, the
+// "swap ok" of the parity line it prints every 30 s.
+extern volatile int native_spawn_seen_backboardd __attribute__((weak_import));
+extern volatile uint32_t native_legacy_swap_accepted_count __attribute__((weak_import));
 }
 // Keyboard Application collection ensures the original generic keyboard
 // personality can match. Report 2 carries the Consumer buttons, bit 0 Menu (Home),
@@ -212,6 +227,12 @@ class NativeHidInput : public IOHIDDevice {
     // injectTapLiftPending marks the down half of the tap whose lift is still due.
     bool injectTapMode=false,injectTapLiftPending=false;
     uint32_t injectTaps=0,injectTapFails=0;
+    // Round 21 deferred unlock (see the header note): injectDeferredReleased lifts the wait once
+    // backboardd and a swap have both been seen and the 30 s quiet has passed; injectDeferredSeen holds
+    // the tick both were first true together. injectFirstTapLogged makes the first tap's moment a log
+    // line of its own.
+    bool injectDeferredReleased=false,injectDeferredLogged=false,injectFirstTapLogged=false;
+    uint64_t injectDeferredSeen=0;
     static unsigned transformCoordinate(int value,int maximum) {
         if(value<0)value=0;if(value>=maximum)value=maximum-1;
         return (unsigned)((long long)value*32767/(maximum-1));
@@ -346,7 +367,8 @@ class NativeHidInput : public IOHIDDevice {
     // One finger swiped from near the bottom of the screen to near the top, 21 samples 20 ms apart, then 5 s of quiet, for as
     // long as the boot lasts: backboardd comes up around t+720 s, so a single gesture would land before anything listens.
     // 32767 is full scale on both axes and Y grows downwards, so 80% is near the bottom of the screen and 20% near the top.
-    enum {kSamples=21,kSampleMs=20,kPauseMs=5000,kCenterX=16383,kStartY=32767*80/100,kEndY=32767*20/100,kOpenGateSeconds=120};
+    enum {kSamples=21,kSampleMs=20,kPauseMs=5000,kCenterX=16383,kStartY=32767*80/100,kEndY=32767*20/100,kOpenGateSeconds=120,
+          kUnlockDelaySeconds=30,kUnlockFallbackSeconds=600};
     // The tap point (round 20): the App Store icon of the user's photo (2364 x 1773) sits at its centre
     // (1470, 540) = (0.622, 0.305) of the panel, which on the 2560 x 1440 panel is (1591, 439). The tap
     // goes through the same report 3 pipe as the gesture (emitTouchReport) and the same panel-to-window
@@ -420,6 +442,12 @@ class NativeHidInput : public IOHIDDevice {
             return;
         }
         injectTapCount(emitTouchReport(3,2,(unsigned short)x,(unsigned short)y));   // tip + valid: the touch down
+        if(!injectFirstTapLogged) {
+            injectFirstTapLogged=true;
+            printf("opi5: hid: inject: first tap at t+%u s (panel %u,%u)\n",
+                   injectFrequency?(unsigned)((injectCounter()-injectStarted)/injectFrequency):0u,
+                   (unsigned)kTapPanelX,(unsigned)kTapPanelY);
+        }
         injectTapLiftPending=true;
         source->setTimeoutMS(kTapLiftMs);
     }
@@ -439,6 +467,41 @@ class NativeHidInput : public IOHIDDevice {
         }
         if(injectGestureActive) {injectSample(source);return;}
         if(injectTapMode) {injectTapTick(source);return;}
+        // Round 21: the deferred unlock gate. Both conditions must hold -- backboardd spawned (patch 0006's
+        // spawn tracker) and at least one display swap completed (LegacyDisplayProbe's swap counter) -- and
+        // then 30 s pass before the first gesture, so the compositor is actually serving. Ten minutes
+        // without both falls back to the plain driver/open gate below (and its own 120 s bounded wait).
+        if(!injectDeferredReleased) {
+            const uint64_t now=injectCounter();
+            const uint64_t up=injectFrequency?(now-injectStarted)/injectFrequency:0;
+            const bool bb=(&native_spawn_seen_backboardd && native_spawn_seen_backboardd!=0);
+            const bool swapped=(&native_legacy_swap_accepted_count && native_legacy_swap_accepted_count!=0);
+            if(bb && swapped) {
+                if(!injectDeferredSeen)injectDeferredSeen=now;
+                const uint64_t since=injectFrequency?(now-injectDeferredSeen)/injectFrequency:0;
+                if(since<(uint64_t)kUnlockDelaySeconds) {
+                    if(!injectDeferredLogged) {
+                        injectDeferredLogged=true;
+                        printf("opi5: hid: inject: unlock deferred (waiting backboardd/swap): both seen at t+%u s (swap %u), gesturing in %d s\n",
+                               (unsigned)up,(&native_legacy_swap_accepted_count)?(unsigned)native_legacy_swap_accepted_count:0u,(int)kUnlockDelaySeconds);
+                    }
+                    source->setTimeoutMS(1000);return;
+                }
+                injectDeferredReleased=true;
+                printf("opi5: hid: inject: unlock at t+%u s: backboardd 1, swap %u, %u s after both seen\n",
+                       (unsigned)up,(&native_legacy_swap_accepted_count)?(unsigned)native_legacy_swap_accepted_count:0u,(unsigned)since);
+            } else {
+                if(!injectDeferredLogged) {
+                    injectDeferredLogged=true;
+                    printf("opi5: hid: inject: unlock deferred (waiting backboardd/swap): backboardd %d swap %u at t+%u s\n",
+                           (int)(bb?1:0),(&native_legacy_swap_accepted_count)?(unsigned)native_legacy_swap_accepted_count:0u,(unsigned)up);
+                }
+                if(up<(uint64_t)kUnlockFallbackSeconds) {source->setTimeoutMS(1000);return;}
+                injectDeferredReleased=true;
+                printf("opi5: hid: inject: unlock deferred: fallback after %u s without backboardd/swap (backboardd %d swap %u), the driver/open gate applies\n",
+                       (unsigned)up,(int)(bb?1:0),(&native_legacy_swap_accepted_count)?(unsigned)native_legacy_swap_accepted_count:0u);
+            }
+        }
         IORegistryEntry *driver=eventDriver(this,4);
         if(!driver) {
             injectNoDriverTicks=injectNoDriverTicks+1;

@@ -15,6 +15,10 @@ Round 20 adds a trace at the same posix_spawn top: with opi5plus-trace-spawn=1 e
 it: apps opened from the desktop spawned fine but never rendered. The block-exec behaviour is
 unchanged -- bluetoothd is still refused, its own line still prints.
 
+Round 21: the entry top also exports backboardd's spawn for the HID injector's unlock gate --
+native_spawn_seen_backboardd is set the moment a posix_spawn target's basename is backboardd,
+whatever the trace switch says, and package/Opi5plusHid reads it through a weak import.
+
 --- a/bsd/kern/kern_exec.c
 +++ b/bsd/kern/kern_exec.c
 @@ -3590,6 +3590,21 @@ posix_spawn(proc_t ap, struct posix_spawn_args *uap, int32_t *retval)
@@ -66,7 +70,7 @@ unchanged -- bluetoothd is still refused, its own line still prints.
  		(void)opi5plus_trace_exec(p, uap);
  	}
  #endif
-@@ -11299,4 +11327,112 @@ opi5plus_report_exits(void)
+@@ -11299,4 +11327,126 @@ opi5plus_report_exits(void)
  		opi5plus_exit_dropped = 0;
  	}
  }
@@ -130,6 +134,15 @@ unchanged -- bluetoothd is still refused, its own line still prints.
 + */
 +static int opi5plus_spawn_trace_on = -1;      /* -1 = the boot argument is not parsed yet */
 +static unsigned opi5plus_spawn_trace_count = 0, opi5plus_spawn_trace_skipped = 0;
++/*
++ * Round 21: the HID injector's unlock gate needs to know that backboardd has spawned, and the spawn
++ * trace top is the one place that sees every posix_spawn(2) -- which is the only path launchd uses
++ * (the execve(2) call site above never fires for launchd jobs). The flag is set whatever the
++ * opi5plus-trace-spawn switch says, because the injector must not depend on a diagnostic switch; the
++ * trace's own cap and switch gate only the printing. package/Opi5plusHid/NativeHidInput.cpp reads it
++ * through a weak import, the same form its native_usb_* mailbox uses.
++ */
++volatile int native_spawn_seen_backboardd = 0;
 +
 +void
 +opi5plus_trace_spawn_entry(proc_t caller, user_addr_t path_pointer, int blocked, int *traced)
@@ -139,6 +152,17 @@ unchanged -- bluetoothd is still refused, its own line still prints.
 +	uint32_t on = 0;
 +
 +	*traced = 0;
++	if (copyinstr(path_pointer, path, sizeof(path), &length) != 0 || length == 0) {
++		strlcpy(path, "?", sizeof(path));
++	}
++	{
++		const char *base = strrchr(path, '/');
++
++		base = (base != NULL) ? (base + 1) : path;
++		if (strcmp(base, "backboardd") == 0) {
++			native_spawn_seen_backboardd = 1;
++		}
++	}
 +	if (opi5plus_spawn_trace_on < 0) {
 +		opi5plus_spawn_trace_on =
 +		    (PE_parse_boot_argn("opi5plus-trace-spawn", &on, sizeof(on)) && on != 0) ? 1 : 0;
@@ -147,9 +171,6 @@ unchanged -- bluetoothd is still refused, its own line still prints.
 +		return;
 +	}
 +	if (blocked != 0) {
-+		if (copyinstr(path_pointer, path, sizeof(path), &length) != 0 || length == 0) {
-+			strlcpy(path, "?", sizeof(path));
-+		}
 +		printf("opi5plus: spawn pid=%d ret=%d path=%s (block-exec)\n",
 +		    proc_getpid(caller), blocked, path);
 +		return;
@@ -161,9 +182,6 @@ unchanged -- bluetoothd is still refused, its own line still prints.
 +			    opi5plus_spawn_trace_skipped);
 +		}
 +		return;
-+	}
-+	if (copyinstr(path_pointer, path, sizeof(path), &length) != 0 || length == 0) {
-+		strlcpy(path, "?", sizeof(path));
 +	}
 +	printf("opi5plus: spawn pid=%d path=%s\n", proc_getpid(caller), path);
 +	opi5plus_spawn_trace_count = opi5plus_spawn_trace_count + 1;

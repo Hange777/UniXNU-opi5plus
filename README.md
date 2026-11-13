@@ -48,7 +48,17 @@ no sig 5/6), CollectionsPoste's SIGKILL loop dies inside the wedge waits, and th
 ledger (723 entries, 211 bluetoothd refusals paired 1:1 with the xpcproxy code-78 corpses a third
 time) plus a 90-tap run that never reached the desktop (the injector's open gate went to the
 kernel-side driver at t+0; backboardd spawned ~9.9 min later) close the round's board record
-([`evidence/round17-result.md`](evidence/round17-result.md)). Earlier
+([`evidence/round17-result.md`](evidence/round17-result.md)). Round 18 (2026-11-13, unattended
+board test) then confirmed the mechanism and retired the bluetoothd noise at its source: the
+new mutex-holder reverse lookup plus the NativeSd lock inventory show all 25 uninterruptible
+waiters queueing on the SystemOS window lock as it rotates through 19 user-mode holders at the
+read path's exact ceiling (5.61 MiB/s, failures 0, reproducing round 17 within ~0.1%) — the
+wedge is **SystemOS cryptex demand-paging bandwidth starvation** on the ~11.5 MB/s PIO path, not
+a deadlock, with the CRU clock-tree 2× as the pending fix lever — and the launchd disabled state
+(disabled.plist written every boot) collapsed the exit-78 storm 211 → 1, took
+`opi5plus-block-exec` off the command line (957 B / 51 arguments), and left the taps' next
+obstacle named: `IOHIDSystem absent` on every registry line, so the synthetic events had no
+consumer ([`evidence/round18-result.md`](evidence/round18-result.md)). Earlier
 rounds' two names cited as USB evidence do not hold: `IOHIDSystem` is not a class of this kernel at all (`evidence/m5/M5-08`), and
 the `XHCI: Initialize DWC3` / `XhcDriverBindingStart` lines are the firmware's own `XhciDxe.efi` printing before
 `DARWINBOOT: hand-off`, so they prove the firmware has USB, not that XNU does. At that point the picture still
